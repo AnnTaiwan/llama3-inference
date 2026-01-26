@@ -12,23 +12,24 @@ Llama3.1-70B 推理 + 轻量级 Profiler（JSON/CSV 自动写入固定目录）
 
 import os
 from pathlib import Path
+import threading
 import types
 from typing import Any, Dict, List, Optional
 import json, csv, uuid, platform, math, time, re
 from datetime import datetime, timezone
 from contextlib import contextmanager, nullcontext
 
-# 🔥 CUDA 内存分配器配置（必须在 import torch 之前）
+#  CUDA 内存分配器配置（必须在 import torch 之前）
 # expandable_segments 与异步流操作可能有冲突，暂时禁用
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 限制分块大小，减少碎片
 
-# 🔥 WSM 无兜底策略：锁定事件驱动调度，禁用同步兜底 (no-fallback)
+#  WSM 无兜底策略：锁定事件驱动调度，禁用同步兜底 (no-fallback)
 os.environ["WSM_NO_FALLBACK"] = "1"
 
-# 🔥 启用层级性能 profiling（CUDA timer 统计 attn/ffn/kv_fetch 等详细时间）
+#  启用层级性能 profiling（CUDA timer 统计 attn/ffn/kv_fetch 等详细时间）
 os.environ["LLM_PROFILE"] = "1"
-CHUNK_SIZE = int(os.environ.setdefault("PREFILL_T_CHUNK", "2048"))
+CHUNK_SIZE = int(os.environ.setdefault("PREFILL_T_CHUNK", "512"))
 MIRCO_BATCH_SIZE  = os.environ.setdefault("MIRCO_BATCH_SIZE", "8")
 ATTN_MICRO_B = os.environ.setdefault("ATTN_MICRO_B", "8")
 import torch
@@ -121,7 +122,19 @@ class InferenceProfiler:
         # 累加两个阶段的 IO 时间（单位：ms）
         self.prefill_io_ms = {"ssd_to_cpu": 0.0, "h2d_param": 0.0}
         self.decode_io_ms = {"ssd_to_cpu": 0.0, "h2d_param": 0.0}
-        
+
+        # GPU timing events for overall inference (用于 finalize 中的 overlap 计算)
+        self.gpu_t0 = None
+        self.gpu_t1 = None
+
+        # H2D GPU events for overlap analysis (记录每次 H2D 传输的 CUDA events)
+        self.h2d_gpu_events = []
+
+        # NVML samples for GPU utilization monitoring
+        self.nvml_samples = []
+        self._nvml_stop = None
+        self._nvml_thread = None
+
         self.meta      = {
             "started_at_utc": _now_utc(),
             "python": platform.python_version(),
@@ -171,13 +184,90 @@ class InferenceProfiler:
     @contextmanager
     def inference_scope(self):
         self.active = True
+
+        # 创建 GPU timing events（如果支持 CUDA）
+        if self.cuda:
+            self.gpu_t0 = torch.cuda.Event(enable_timing=True)
+            self.gpu_t1 = torch.cuda.Event(enable_timing=True)
+            self.gpu_t0.record()
+
         with self.span("inference_e2e", "inference"):
             yield
+
+        # 记录结束 event
+        if self.cuda and self.gpu_t1 is not None:
+            self.gpu_t1.record()
+
         self.active = False
     
     def now_ms(self) -> float:
         """当前相对 t0 的墙钟时间（毫秒），供外部补丁使用。"""
         return (time.perf_counter_ns() - self.t0_ns) / 1e6
+
+    # ---------------- NVML util 采样（可选） ----------------
+    def _start_nvml_sampler(self):
+        """启动 NVML 采样线程。
+
+        说明：NVML 的 util 采样周期由驱动决定，通常在 ~1s 到 ~166ms 之间波动。
+        因此采样间隔设得比 100ms 更小也不一定会更精确。
+        """
+        try:
+            import pynvml  # pip install nvidia-ml-py
+        except Exception as e:
+            print(f"[NVML] pynvml not available: {e}")
+            return
+
+        interval_s = float(os.getenv("PROFILER_NVML_INTERVAL_S", "0.2"))
+        interval_s = max(0.05, interval_s)
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        stop_evt = threading.Event()
+        self._nvml_stop = stop_evt
+        # 使用 self.nvml_samples（已在 __init__ 中初始化）
+
+        def _worker():
+            while not stop_evt.is_set():
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    self.nvml_samples.append({
+                        "t_ms": self.now_ms(),
+                        "gpu": int(getattr(util, "gpu", 0)),  # 修正：使用 "gpu" 而不是 "gpu_util"
+                        "mem": int(getattr(util, "memory", 0)),  # 修正：使用 "mem" 而不是 "mem_util"
+                        "mem_used_B": int(getattr(mem, "used", 0)),
+                        "mem_total_B": int(getattr(mem, "total", 0)),
+                    })
+                except Exception:
+                    pass
+                time.sleep(interval_s)
+
+        th = threading.Thread(target=_worker, name="nvml_sampler", daemon=True)
+        self._nvml_thread = th
+        th.start()
+
+    def _stop_nvml_sampler(self):
+        try:
+            import pynvml
+        except Exception:
+            pynvml = None
+
+        if self._nvml_stop is not None:
+            try:
+                self._nvml_stop.set()
+            except Exception:
+                pass
+        if self._nvml_thread is not None:
+            try:
+                self._nvml_thread.join(timeout=2.0)
+            except Exception:
+                pass
+
+        if pynvml is not None:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
 
     def set_phase(self, phase: str):
         """切换当前 phase：setup / prefill / decode"""
@@ -426,10 +516,12 @@ class InferenceProfiler:
         # -------- 2. E2E / prefill / decode 墙钟时间 --------
         # inference_scope() 用 "inference_e2e" 包裹整个推理
         infer_spans = [ev for ev in self.timeline if ev.get("name") == "inference_e2e"]
+        infer_t0_ms: Optional[float] = None
+        infer_t1_ms: Optional[float] = None
         if infer_spans:
-            t0 = min(float(ev["t_start_ms"]) for ev in infer_spans)
-            t1 = max(float(ev["t_end_ms"]) for ev in infer_spans)
-            e2e_ms = t1 - t0
+            infer_t0_ms = min(float(ev["t_start_ms"]) for ev in infer_spans)
+            infer_t1_ms = max(float(ev["t_end_ms"]) for ev in infer_spans)
+            e2e_ms = infer_t1_ms - infer_t0_ms
         else:
             e2e_ms = None
 
@@ -540,6 +632,159 @@ class InferenceProfiler:
         }
         if self.wsm_runtime:
             wsm_stats["runtime"] = self.wsm_runtime
+
+        # -------- 6.x 论文友好指标：用 interval-union 计算 IO busy time / bubble / overlap --------
+        # 关键点：
+        # - sum(dur_ms) 会把并发的 I/O 请求 latency 叠加，从而严重夸大 IO_total；
+        # - 对吞吐/利用率/overlap 更自洽的是用区间并集 (union) 代表“设备忙碌时长”。
+        def _merge_intervals(intervals: List[tuple[float, float]]) -> List[tuple[float, float]]:
+            if not intervals:
+                return []
+            intervals = sorted(intervals)
+            merged = [list(intervals[0])]
+            for s, e in intervals[1:]:
+                if s <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], e)
+                else:
+                    merged.append([s, e])
+            return [(float(s), float(e)) for s, e in merged]
+
+        def _union_ms(intervals: List[tuple[float, float]]) -> float:
+            m = _merge_intervals(intervals)
+            return float(sum(e - s for s, e in m))
+
+        def _clip_to_infer_window(s: float, e: float) -> Optional[tuple[float, float]]:
+            if infer_t0_ms is None or infer_t1_ms is None:
+                return (s, e)
+            # 严格限制在 [infer_t0, infer_t1]
+            s2 = max(float(s), float(infer_t0_ms))
+            e2 = min(float(e), float(infer_t1_ms))
+            if e2 <= s2:
+                return None
+            return (s2, e2)
+
+        def _collect_intervals(name: str, *, phase: Optional[str] = None) -> List[tuple[float, float]]:
+            out: List[tuple[float, float]] = []
+            for ev in self.timeline:
+                if ev.get("name") != name:
+                    continue
+                if phase is not None and str(ev.get("phase", "unknown")) != phase:
+                    continue
+                s = float(ev.get("t_start_ms", 0.0))
+                e = float(ev.get("t_end_ms", 0.0))
+                clipped = _clip_to_infer_window(s, e)
+                if clipped is not None:
+                    out.append(clipped)
+            return out
+
+        def _sum_dur_ms(name: str, *, phase: Optional[str] = None) -> float:
+            total = 0.0
+            for ev in self.timeline:
+                if ev.get("name") != name:
+                    continue
+                if phase is not None and str(ev.get("phase", "unknown")) != phase:
+                    continue
+                total += float(ev.get("dur_ms", 0.0))
+            return float(total)
+
+        def _sum_bytes(name: str, *, phase: Optional[str] = None) -> float:
+            total = 0.0
+            for ev in self.timeline:
+                if ev.get("name") != name:
+                    continue
+                if phase is not None and str(ev.get("phase", "unknown")) != phase:
+                    continue
+                total += float(ev.get("bytes", 0.0))
+            return float(total)
+
+        # CPU time domain：SSD reads / (fallback) H2D enqueue / wait (bubble)
+        ssd_intv = _collect_intervals("wsm.ssd_to_cpu_layer")
+        h2d_intv_cpu = _collect_intervals("wsm.h2d_param")
+        wait_intv = _collect_intervals("wsm.wait_group_ready")
+
+        ssd_union_ms = _union_ms(ssd_intv)
+        h2d_union_ms_cpu = _union_ms(h2d_intv_cpu)
+        wait_union_ms = _union_ms(wait_intv)
+        io_union_ms_cpu = _union_ms(ssd_intv + h2d_intv_cpu)
+
+        ssd_bytes = _sum_bytes("wsm.ssd_to_cpu_layer")
+        h2d_bytes = _sum_bytes("wsm.h2d_param")
+
+        # 以 inference wall 作为平均吞吐的分母；以 union 作为 active 吞吐的分母
+        wall_s = (e2e_ms / 1000.0) if (e2e_ms is not None and e2e_ms > 0) else None
+        ssd_active_s = ssd_union_ms / 1000.0 if ssd_union_ms > 0 else None
+        h2d_active_s_cpu = h2d_union_ms_cpu / 1000.0 if h2d_union_ms_cpu > 0 else None
+
+        def _bw_gbs(bytes_: float, seconds: Optional[float]) -> Optional[float]:
+            if seconds is None or seconds <= 0 or bytes_ <= 0:
+                return None
+            return float(bytes_ / seconds / 1e9)
+
+        bubble_ratio = (wait_union_ms / e2e_ms) if (e2e_ms and e2e_ms > 0) else None
+        io_hidden_ratio_est = None
+        io_hidden_ms_est = None
+        if io_union_ms_cpu > 0:
+            io_hidden_ms_est = max(0.0, io_union_ms_cpu - wait_union_ms)
+            io_hidden_ratio_est = max(0.0, min(1.0, io_hidden_ms_est / io_union_ms_cpu))
+
+        paper_cpu_io = {
+            "inference_window_ms": {
+                "t0_ms": infer_t0_ms,
+                "t1_ms": infer_t1_ms,
+                "wall_ms": e2e_ms,
+            },
+            "bubble": {
+                "wait_group_ready_union_ms": wait_union_ms,
+                "wait_group_ready_sum_ms": _sum_dur_ms("wsm.wait_group_ready"),
+                "bubble_ratio": bubble_ratio,
+            },
+            "ssd": {
+                "bytes": ssd_bytes,
+                "active_union_ms": ssd_union_ms,
+                "busy_fraction": (ssd_union_ms / e2e_ms) if (e2e_ms and e2e_ms > 0) else None,
+                "avg_bw_GBps": _bw_gbs(ssd_bytes, wall_s),
+                "active_bw_GBps": _bw_gbs(ssd_bytes, ssd_active_s),
+                "sum_dur_ms": _sum_dur_ms("wsm.ssd_to_cpu_layer"),
+                "concurrency_factor": (
+                    (_sum_dur_ms("wsm.ssd_to_cpu_layer") / ssd_union_ms) if ssd_union_ms > 0 else None
+                ),
+            },
+            "h2d_cpu_enq": {
+                "bytes": h2d_bytes,
+                "active_union_ms": h2d_union_ms_cpu,
+                "busy_fraction": (h2d_union_ms_cpu / e2e_ms) if (e2e_ms and e2e_ms > 0) else None,
+                "avg_bw_GBps": _bw_gbs(h2d_bytes, wall_s),
+                "active_bw_GBps": _bw_gbs(h2d_bytes, h2d_active_s_cpu),
+                "sum_dur_ms": _sum_dur_ms("wsm.h2d_param"),
+                "note": "This is CPU-side enqueue/driver overhead; real PCIe DMA time should be measured with CUDA events (see h2d_gpu section).",
+            },
+            "io_overlap_est": {
+                "io_union_ms": io_union_ms_cpu,
+                "io_hidden_ms_est": io_hidden_ms_est,
+                "io_hidden_ratio_est": io_hidden_ratio_est,
+            },
+        }
+
+        # 按 phase 拆分的 union 指标（prefill / decode）
+        phase_union_metrics: Dict[str, Any] = {}
+        for _ph in ("prefill", "decode"):
+            _ssd = _collect_intervals("wsm.ssd_to_cpu_layer", phase=_ph)
+            _h2d = _collect_intervals("wsm.h2d_param", phase=_ph)
+            _wait = _collect_intervals("wsm.wait_group_ready", phase=_ph)
+            _io_union = _union_ms(_ssd + _h2d)
+            _wait_union = _union_ms(_wait)
+            _hidden_ms = max(0.0, _io_union - _wait_union) if _io_union > 0 else None
+            _hidden_ratio = (
+                max(0.0, min(1.0, (_hidden_ms / _io_union))) if (_io_union and _hidden_ms is not None) else None
+            )
+            phase_union_metrics[_ph] = {
+                "ssd_union_ms": _union_ms(_ssd),
+                "h2d_union_ms_cpu": _union_ms(_h2d),
+                "wait_union_ms": _wait_union,
+                "io_union_ms_cpu": _io_union,
+                "io_hidden_ms_est": _hidden_ms,
+                "io_hidden_ratio_est": _hidden_ratio,
+            }
 
         # -------- 6. 每个 decoder layer 的 compute / IO / 带宽统计 --------
         decoder_layers_global: Dict[str, float] = {}
@@ -852,20 +1097,6 @@ class InferenceProfiler:
             "mha_ffn_decouple": mha_ffn_stats,
         }
 
-
-
-        # 也把 overlap_ratio 放进 decode 统计里，方便用 timings.decode.overlap_ratio 访问
-        if overlap_ratio is not None:
-            decode_stats["overlap_ratio"] = overlap_ratio
-            decode_stats["approx_compute_ms_total"] = decoder_compute_ms_total
-            decode_stats["approx_io_ms_total"] = decoder_io_ms_total
-
-        decoder_layers = {
-            "global": decoder_layers_global,
-            "per_layer": decoder_layers_per_layer,
-            "summary": decoder_layers_summary,
-        }
-
         # -------- 8. throughput 统计 --------
         # 先准备 token 统计
         tokens_in_total = tokens_in * bsz if tokens_in is not None else None
@@ -943,6 +1174,10 @@ class InferenceProfiler:
         prefill_compute_ms = self.prefill_compute_us / 1000.0
         prefill_io_ms = self.prefill_io_ms["ssd_to_cpu"] + self.prefill_io_ms["h2d_param"]
         prefill_wall_ms = prefill_total_ms if prefill_total_ms else 0.0
+        prefill_union = phase_union_metrics.get("prefill", {}) if "phase_union_metrics" in locals() else {}
+        prefill_io_union_ms = float(prefill_union.get("io_union_ms_cpu") or 0.0)
+        prefill_wait_union_ms = float(prefill_union.get("wait_union_ms") or 0.0)
+        prefill_io_hidden_ratio_est = prefill_union.get("io_hidden_ratio_est")
         pref_ovl_ms, pref_uncovered_ms, pref_ratio = calc_overlap(
             prefill_compute_ms, prefill_io_ms, prefill_wall_ms
         )
@@ -951,6 +1186,10 @@ class InferenceProfiler:
         decode_compute_ms = self.decode_compute_us / 1000.0
         decode_io_ms = self.decode_io_ms["ssd_to_cpu"] + self.decode_io_ms["h2d_param"]
         decode_wall_ms = decode_stats.get("sum_ms", 0.0) if decode_stats else 0.0
+        decode_union = phase_union_metrics.get("decode", {}) if "phase_union_metrics" in locals() else {}
+        decode_io_union_ms = float(decode_union.get("io_union_ms_cpu") or 0.0)
+        decode_wait_union_ms = float(decode_union.get("wait_union_ms") or 0.0)
+        decode_io_hidden_ratio_est = decode_union.get("io_hidden_ratio_est")
         dec_ovl_ms, dec_uncovered_ms, dec_ratio = calc_overlap(
             decode_compute_ms, decode_io_ms, decode_wall_ms
         )
@@ -982,6 +1221,10 @@ class InferenceProfiler:
                     "wall_ms": prefill_wall_ms,
                     "compute_ms": prefill_compute_ms,
                     "io_ms": prefill_io_ms,
+                    # 更自洽：用 interval union 表示“IO busy time”
+                    "io_union_ms_cpu": prefill_io_union_ms,
+                    "bubble_union_ms": prefill_wait_union_ms,
+                    "io_hidden_ratio_est": prefill_io_hidden_ratio_est,
                     "io_breakdown_ms": {
                         "ssd_to_cpu": self.prefill_io_ms["ssd_to_cpu"],
                         "h2d_param": self.prefill_io_ms["h2d_param"],
@@ -995,6 +1238,10 @@ class InferenceProfiler:
                     "wall_ms": decode_wall_ms,
                     "compute_ms": decode_compute_ms,
                     "io_ms": decode_io_ms,
+                    # 更自洽：用 interval union 表示“IO busy time”
+                    "io_union_ms_cpu": decode_io_union_ms,
+                    "bubble_union_ms": decode_wait_union_ms,
+                    "io_hidden_ratio_est": decode_io_hidden_ratio_est,
                     "io_breakdown_ms": {
                         "ssd_to_cpu": self.decode_io_ms["ssd_to_cpu"],
                         "h2d_param": self.decode_io_ms["h2d_param"],
@@ -1020,6 +1267,131 @@ class InferenceProfiler:
             except Exception:
                 memory_stats = {}
 
+        # -------- 10.5 GPU/H2D overlap（CUDA event，跨 stream 计算）--------
+        # 说明：CUDA event 时间戳在同一 device 上是全局一致的，可用 elapsed_time 做跨 stream 对齐。
+        paper_gpu_h2d: Dict[str, Any] = {}
+        if self.cuda and self.gpu_t0 is not None and self.gpu_t1 is not None:
+            try:
+                # 仅同步 default stream 的 t1，避免无关后台 stream 让 finalize 卡死。
+                self.gpu_t1.synchronize()
+                gpu_infer_ms = float(self.gpu_t0.elapsed_time(self.gpu_t1))
+
+                def _merge(intervals: List[tuple[float, float]]) -> List[tuple[float, float]]:
+                    if not intervals:
+                        return []
+                    intervals = sorted(intervals)
+                    out = [list(intervals[0])]
+                    for s, e in intervals[1:]:
+                        if s <= out[-1][1]:
+                            out[-1][1] = max(out[-1][1], e)
+                        else:
+                            out.append([s, e])
+                    return [(float(s), float(e)) for s, e in out]
+
+                def _union_len(intervals: List[tuple[float, float]]) -> float:
+                    m = _merge(intervals)
+                    return float(sum(e - s for s, e in m))
+
+                def _intersect_len(a: List[tuple[float, float]], b: List[tuple[float, float]]) -> float:
+                    a = _merge(a)
+                    b = _merge(b)
+                    i = j = 0
+                    total = 0.0
+                    while i < len(a) and j < len(b):
+                        s = max(a[i][0], b[j][0])
+                        e = min(a[i][1], b[j][1])
+                        if e > s:
+                            total += (e - s)
+                        if a[i][1] <= b[j][1]:
+                            i += 1
+                        else:
+                            j += 1
+                    return float(total)
+
+                # compute intervals：用 forward wrapper 的 start/end events
+                compute_intv: List[tuple[float, float]] = []
+                for kind, _bsz, _seqlen, s_ev, e_ev in self.forward_events:
+                    # forward 的 end_evt 在 finalize 前已经 synchronize 过；这里再 query 一下做保险
+                    try:
+                        if hasattr(e_ev, "query") and (not e_ev.query()):
+                            continue
+                        s = float(self.gpu_t0.elapsed_time(s_ev))
+                        e = float(self.gpu_t0.elapsed_time(e_ev))
+                        # clip 到 [0, gpu_infer_ms]
+                        s = max(0.0, min(s, gpu_infer_ms))
+                        e = max(0.0, min(e, gpu_infer_ms))
+                        if e > s:
+                            compute_intv.append((s, e))
+                    except Exception:
+                        continue
+
+                # h2d intervals：来自 WSM _install_group_on_gpu patch
+                h2d_intv: List[tuple[float, float]] = []
+                h2d_bytes_infer = 0.0
+                for ev in self.h2d_gpu_events:
+                    try:
+                        e_ev = ev["e_ev"]
+                        s_ev = ev["s_ev"]
+                        if hasattr(e_ev, "query") and (not e_ev.query()):
+                            # 如果 transfer 还没完成（可能是推理结束后的预取尾巴），就先跳过
+                            continue
+                        s = float(self.gpu_t0.elapsed_time(s_ev))
+                        e = float(self.gpu_t0.elapsed_time(e_ev))
+                        # clip 到 [0, gpu_infer_ms]
+                        s_c = max(0.0, min(s, gpu_infer_ms))
+                        e_c = max(0.0, min(e, gpu_infer_ms))
+                        if e_c > s_c:
+                            h2d_intv.append((s_c, e_c))
+                            # bytes 也按同样的 clip（近似）：只要 interval 有交集就计入 bytes
+                            h2d_bytes_infer += float(ev.get("bytes", 0.0))
+                    except Exception:
+                        continue
+
+                compute_union_ms = _union_len(compute_intv)
+                h2d_union_ms = _union_len(h2d_intv)
+                overlap_ms = _intersect_len(compute_intv, h2d_intv)
+                overlap_ratio = (overlap_ms / h2d_union_ms) if h2d_union_ms > 0 else None
+
+                def _bw(bytes_: float, ms: float) -> Optional[float]:
+                    if bytes_ <= 0 or ms <= 0:
+                        return None
+                    return float(bytes_ / (ms / 1000.0) / 1e9)
+
+                paper_gpu_h2d = {
+                    "gpu_infer_ms": gpu_infer_ms,
+                    "compute_union_ms": compute_union_ms,
+                    "h2d_union_ms": h2d_union_ms,
+                    "h2d_bytes": h2d_bytes_infer,
+                    "h2d_active_bw_GBps": _bw(h2d_bytes_infer, h2d_union_ms) if h2d_union_ms > 0 else None,
+                    "h2d_avg_bw_GBps": _bw(h2d_bytes_infer, gpu_infer_ms) if gpu_infer_ms > 0 else None,
+                    "h2d_compute_overlap_ms": overlap_ms,
+                    "h2d_overlap_ratio": overlap_ratio,
+                }
+            except Exception:
+                paper_gpu_h2d = {}
+
+        # NVML util summary（如果启用 NVML sampler）
+        nvml_summary: Dict[str, Any] = {}
+        if self.nvml_samples:
+            try:
+                gpu_utils = [int(s.get("gpu", 0)) for s in self.nvml_samples if s.get("gpu") is not None]
+                mem_utils = [int(s.get("mem", 0)) for s in self.nvml_samples if s.get("mem") is not None]
+                def _pct(xs, p):
+                    if not xs:
+                        return None
+                    xs2 = sorted(xs)
+                    i = int((len(xs2)-1)*p)
+                    return xs2[i]
+                nvml_summary = {
+                    "num_samples": len(self.nvml_samples),
+                    "gpu_util_avg_pct": (sum(gpu_utils)/len(gpu_utils)) if gpu_utils else None,
+                    "gpu_util_p50_pct": _pct(gpu_utils, 0.50),
+                    "gpu_util_p90_pct": _pct(gpu_utils, 0.90),
+                    "mem_util_avg_pct": (sum(mem_utils)/len(mem_utils)) if mem_utils else None,
+                }
+            except Exception:
+                nvml_summary = {}
+
         # -------- 11. 汇总成 result --------
         self.result = {
             "run": self.meta
@@ -1035,6 +1407,12 @@ class InferenceProfiler:
             },
             "timings": timings,
             "throughput": throughput,
+            "paper_metrics": {
+                "cpu_io": paper_cpu_io,
+                "phase_union": phase_union_metrics,
+                "gpu_h2d": paper_gpu_h2d,
+                "nvml": nvml_summary,
+            },
             "wsm": wsm_stats,
             "decoder_layers": decoder_layers,
             "decode_step_ms": decode_ms,
@@ -1253,6 +1631,13 @@ def _wrap_wait_group_ready(original_method):
             "group": str(group),
         }
 
+        # phase：prefill / decode（用于论文/分析拆分）
+        if prof is not None:
+            try:
+                extras["phase"] = getattr(self, "_phase", None) or getattr(prof, "phase", "unknown")
+            except Exception:
+                extras["phase"] = getattr(prof, "phase", "unknown")
+
         # 1) slack_ms = 现在时间 - 该 group ready 事件记录时间
         if prof is not None and hasattr(self, "_group_ready_wallclock"):
             try:
@@ -1427,13 +1812,14 @@ def _patch_wsm_for_profiling(wsm):
             finally:
                 e = time.perf_counter_ns()
                 rec = {
-                    "name": "wsm.wait_group_ready",
+                    "name": "wsm.group_ready_event",
                     "cat": "wsm",
                     "t_start_ms": (s - prof.t0_ns) / 1e6,
                     "t_end_ms":   (e - prof.t0_ns) / 1e6,
                     "dur_ms":     (e - s) / 1e6,
                     "layer_idx":  int(layer_idx),
                     "group":      str(group),
+                    "phase":      getattr(self, "_phase", None) or getattr(prof, "phase", "unknown"),
                 }
                 prof.timeline.append(rec)
 
@@ -1544,6 +1930,39 @@ def _patch_wsm_for_profiling(wsm):
                 bytes=int(total_bytes),
                 phase=phase,
             ):
+                # 关键：CPU wall time 只能测到 enqueue/调度开销，不能代表真实的 PCIe H2D 传输时间。
+                # 这里额外用 CUDA events 在 **实际 H2D stream** 上打点，最后在 finalize 统一同步计算。
+                if torch.cuda.is_available() and getattr(prof, "gpu_t0", None) is not None:
+                    try:
+                        # 选择与原实现一致的 H2D stream（不改变逻辑，仅显式拿到 stream 做 event record）
+                        stream = h2d_override
+                        if stream is None and hasattr(self, "_select_h2d_stream_for"):
+                            stream = self._select_h2d_stream_for(module_name=grp)
+
+                        if stream is not None:
+                            s_ev = torch.cuda.Event(enable_timing=True)
+                            e_ev = torch.cuda.Event(enable_timing=True)
+                            with torch.cuda.stream(stream):
+                                s_ev.record()
+
+                            ret = orig_install(layer_idx, group, h2d_override=stream)
+
+                            with torch.cuda.stream(stream):
+                                e_ev.record()
+
+                            prof.h2d_gpu_events.append({
+                                "phase": phase,
+                                "layer_idx": lid,
+                                "group": grp,
+                                "bytes": int(total_bytes),
+                                "s_ev": s_ev,
+                                "e_ev": e_ev,
+                            })
+                            return ret
+                    except Exception:
+                        # 出错就退回原逻辑（不影响正确性）
+                        pass
+
                 return orig_install(layer_idx, group, h2d_override=h2d_override)
 
         wsm._install_group_on_gpu = types.MethodType(_install_group_on_gpu_patched, wsm)
@@ -1691,37 +2110,28 @@ def main():
     # PYTORCH_CUDA_ALLOC_CONF 已在顶部设置（必须在 import torch 前）
 
     # ============================================================
-    # ⭐ 异步滑动窗口 - RTX 5080 (16GB) + 125GB RAM 实测优化
-    # ============================================================
-    # 硬件容量：GPU 12GB 可用 → 11 组 | RAM 110GB 可用 → 60 层
-    # 策略：异步窗口 + 适度并发 + RAM 缓存优化
+    # 异步滑动窗口 - RTX 5080 (16GB) + 125GB RAM 
     # ============================================================
 
-    # ⭐⭐⭐ P0 修复: 增加 warmup 层数，确保完整 overlap
-    # 单层计算 100ms，可以 overlap 4 组 H2D (每组 25ms)
     # Warmup 至少需要覆盖: 初始层 + 预取深度 = 12 层
-    GPU_AHEAD_LAYERS = 6# 预取 6 组（3 层）- 适配 11 组容量
+    GPU_AHEAD_LAYERS = 8
     GPU_MAX_GROUPS   = 12
-    GPU_WARMUP_LAYERS = 6# ⭐ 6 → 12 层（24 组），确保前 12 层完全 overlap
+    GPU_WARMUP_LAYERS = 10
     CPU_CACHE_LAYERS = 47# 
-    DEFAULT_BATCH_SIZE  = int(os.getenv("PROMPT_BATCH", "32"))   # 推理 batch size
+    DEFAULT_BATCH_SIZE  = int(os.getenv("PROMPT_BATCH", "64"))   # 推理 batch size
     DEFAULT_MAX_GEN_LEN = int(os.getenv("GEN_TOKENS", "32"))    # 每个样本生成 token 数
-    # ✅ 大 batch 时缩小 GPU group 预算，给激活和 KV 腾显存
-    if DEFAULT_BATCH_SIZE >= 64:
-        GPU_MAX_GROUPS = 2
-    # elif DEFAULT_BATCH_SIZE >= 32:
-    #     GPU_MAX_GROUPS = 4
 
 
-    # === H2D 并发控制（⭐⭐⭐ P0 优化：PCIe Gen5 + RTX 5080 高带宽配置） ===
+
+    # === H2D 并发控制（PCIe Gen5 + RTX 5080 高带宽配置） ===
     # PCIe Gen5 x16 带宽: 64GB/s (Gen4的2倍)
     # 70B模型每组权重~1.5GB → Gen5单次H2D只需~25ms（Gen4的一半）
     # 更高带宽意味着需要更高并发度才能饱和PCIe，避免流水线空隙
-    os.environ.setdefault("WSM_H2D_BASE_CONCURRENCY",  "8")   # ⭐ 5→16（Gen5高带宽，基础并发）
-    os.environ.setdefault("WSM_H2D_PREFILL_MULT",      "3")  # Prefill: 32 并发
-    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "3")  # ⭐ 1.0→1.5（Decode: 24 并发）
-    os.environ.setdefault("WSM_MAX_INFLIGHT_GROUPS",   "32")   # ⭐ 16→32（Inflight 上限，匹配并发）
-    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "96")   # ⭐ 48→96（H2D 队列，Gen5需要更深队列）
+    os.environ.setdefault("WSM_H2D_BASE_CONCURRENCY",  "32")   #  5→16（Gen5高带宽，基础并发）
+    os.environ.setdefault("WSM_H2D_PREFILL_MULT",      "4")  # Prefill: 32 并发
+    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "2")  #  1.0→1.5（Decode: 24 并发）
+    os.environ.setdefault("WSM_MAX_INFLIGHT_GROUPS",   "128")   #  16→32（Inflight 上限，匹配并发）
+    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "256")   #  48→96（H2D 队列，Gen5需要更深队列）
 
     # === 异步逐出机制 ===
     os.environ.setdefault("WSM_EVICT_QUEUE_SIZE",      "96")   # 逐出队列容量
@@ -1732,8 +2142,8 @@ def main():
     os.environ.setdefault("WSM_GPU_AHEAD_GROUPS",      str(GPU_AHEAD_LAYERS))
 
     # Group 级预取深度：prefill 保守，decode aggressive
-    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_PREFILL",  "2")  # prefill 只前瞻少量 group
-    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_DECODE",   "5")  # decode 保持热数据在 GPU  
+    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_PREFILL",  "10")  # prefill 只前瞻少量 group
+    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_DECODE",   "10")  # decode 保持热数据在 GPU  
     os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))
     os.environ.setdefault("WSM_GPU_BEHIND",            "2")    # 保留最近 2 层
 
@@ -1761,11 +2171,11 @@ def main():
 
     # === Prefill 特定优化 ===
     os.environ.setdefault("PREFILL_CPU_LAYERS",        str(CPU_CACHE_LAYERS))   # Prefill CPU 缓存 50 层
-    os.environ.setdefault("PREFILL_GPU_LAYERS",        str(GPU_WARMUP_LAYERS))  # ⭐ 6 → 12 层
+    os.environ.setdefault("PREFILL_GPU_LAYERS",        str(GPU_WARMUP_LAYERS))  #  6 → 12 层
     os.environ.setdefault("PREFILL_PREFETCH_DISTANCE", "10")   # Layer 级预取保持稍大，提前准备更多层
     os.environ.setdefault("DECODE_PREFETCH_DISTANCE",  "4")    # Decode 压小，重心在重叠 token 计算
-    os.environ.setdefault("WSM_WARMUP_LAYERS_GPU",     str(GPU_WARMUP_LAYERS))  # ⭐ 6 → 12 层
-    os.environ.setdefault("WSM_WRAPAROUND_WARMUP",     str(GPU_WARMUP_LAYERS))  # ⭐ 6 → 12 层
+    os.environ.setdefault("WSM_WARMUP_LAYERS_GPU",     str(GPU_WARMUP_LAYERS))  #  6 → 12 层
+    os.environ.setdefault("WSM_WRAPAROUND_WARMUP",     str(GPU_WARMUP_LAYERS))  #  6 → 12 层
     
     # chunk & micro-batch 大小（与并发匹配）
     os.environ.setdefault("PREFILL_T_CHUNK", str(CHUNK_SIZE)) 
@@ -1817,9 +2227,9 @@ def main():
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
-        "max_cached_layers": CPU_CACHE_LAYERS,         # ✅ 修复: 必须与 CPU_CAP_VALUE 一致
+        "max_cached_layers": CPU_CACHE_LAYERS,         # 必须与 CPU_CAP_VALUE 一致
         "cpu_cache_layers": CPU_CACHE_LAYERS,          # CPU 环形容量
-        "warmup_layers": max(PRIME_WINDOW, GPU_AHEAD_LAYERS + 2),  # ✅ Fix: 至少预热 GPU_AHEAD + 2 层
+        "warmup_layers": max(PRIME_WINDOW, GPU_AHEAD_LAYERS + 2),  #  Fix: 至少预热 GPU_AHEAD + 2 层
         "staging_mb": 64,
         "verbose": True,
         "gpu_max_groups": GPU_MAX_GROUPS,
@@ -1863,9 +2273,9 @@ def main():
         wsm._ensure_module_on_gpu = types.MethodType(_patched_ensure_module_on_gpu, wsm)
         print("[WSM PATCH] Profiler wrapper + CPU stub loader enabled")
 
-        # ⭐⭐⭐ P0 优化：GPU窗口预热（避免冷启动，前N层并行H2D）
+        # GPU窗口预热（避免冷启动，前N层并行H2D）
         with PROFILER.span("gpu_window_warmup", "setup"):
-            warmup_layers = GPU_WARMUP_LAYERS  # ⭐ 使用配置的 12 层
+            warmup_layers = GPU_WARMUP_LAYERS  #  使用配置的 12 层
             print(f"[WSM WARMUP] Preloading first {warmup_layers} layers to GPU...")
             for layer_idx in range(min(warmup_layers, wsm.n_layers)):
                 try:
@@ -1876,16 +2286,6 @@ def main():
                     print(f"[WSM WARMUP] Layer {layer_idx} prefetch failed: {e}")
             print(f"[WSM WARMUP] Warmup requests sent (async), first {warmup_layers} layers (24 groups) will be ready before inference")
 
-            # ⭐⭐⭐ 额外修复：等待 warmup 完成后，继续预取后续层建立流水线
-            # 在推理开始前，预取 L12-L20，确保 L12+ 也能 overlap
-            # print(f"[WSM WARMUP] Extending prefetch pipeline to L{warmup_layers + 8}...")
-            # for layer_idx in range(warmup_layers, min(warmup_layers + 8, wsm.n_layers)):
-            #     try:
-            #         wsm.prefetch_group_async(layer_idx, "attn", reason="warmup_extend")
-            #         # 不预取 ffn，节省并发槽位
-            #     except Exception as e:
-            #         pass
-            # print(f"[WSM WARMUP] Extended pipeline ready")
 
     PROFILER.wrap_model_forward(llama.model)
 

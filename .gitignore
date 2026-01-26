@@ -73,3 +73,18 @@ Thumbs.db
 /checkpoints/history/
 history1/
 /log
+
+# profiling outputs
+nsight_profiles/
+*.nsys-rep
+nsight_profiles/
+*.nsys-rep
+*.qdrep
+anthropic/
+gdpval_data/
+**/hf_dataset/
+*.arrow
+*.jsonl
+nsight_profiles/
+*.nsys-rep
+*.qdrep
