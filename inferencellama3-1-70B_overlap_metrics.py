@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-Llama3.1-70B 推理 + 轻量级 Profiler（JSON/CSV 自动写入固定目录）
-- 记录会影响 inference 的关键路径用时（prefill / decode per-token / e2e / FTL 近似 / 吞吐）
-- 同时记录不会影响 inference 的准备/探针/日志时间（non_inference 类别）
-- 对 WSM 两个关键函数（wait_group_ready / _ensure_module_on_gpu）做埋点统计
-- 采用 CUDA Events 逐 token 计时，统一同步，尽量低扰动
-- 生成结果固定写入 LOG_DIR，自动输出 JSON + CSV 两种格式
-"""
-
 import os
 from pathlib import Path
 import threading
 import types
 from typing import Any, Dict, List, Optional
-import json, csv, uuid, platform, math, time, re
+import json
+import csv
+import uuid
+import platform
+import time
+import re
 from datetime import datetime, timezone
 from contextlib import contextmanager, nullcontext
 
@@ -32,7 +27,7 @@ os.environ["LLM_PROFILE"] = "1"
 CHUNK_SIZE = int(os.environ.setdefault("PREFILL_T_CHUNK", "512"))
 MIRCO_BATCH_SIZE  = os.environ.setdefault("MIRCO_BATCH_SIZE", "8")
 ATTN_MICRO_B = os.environ.setdefault("ATTN_MICRO_B", "8")
-import torch
+import torch  # noqa: E402
 
 # Optional NVTX for GPU decode-step ranges
 try:
@@ -47,9 +42,9 @@ LOG_DIR = Path("/home/roger/logs")   # 自动创建
 RUN_TAG = ""                         # 例如 "ablation-a1"；留空则自动仅用 run_id
 
 # ===== 项目内模块 =====
-from llama3.generator import LLaMA
-from llama3.config import KVCacheArgs, load_runtime_config, runtime_config_to_dict
-from llama3 import generator as _gen, stream_mnt
+from llama3.generator import LLaMA  # noqa: E402
+from llama3.config import KVCacheArgs, load_runtime_config, runtime_config_to_dict  # noqa: E402
+from llama3 import generator as _gen, stream_mnt  # noqa: E402
 try:
     from llama3.layers import PERF_TRACKER  # 新增：从 layers.py 拿到全局的性能统计器
 except Exception:
@@ -287,11 +282,13 @@ class InferenceProfiler:
             for k in ("tokens", "input_ids"):
                 t = kwargs.get(k, None)
                 if torch.is_tensor(t) and t.dim() == 2:
-                    cand = t; break
+                    cand = t
+                    break  
             if cand is None:
                 for a in args:
                     if torch.is_tensor(a) and a.dtype in (torch.long, torch.int32, torch.int64) and a.dim() == 2:
-                        cand = a; break
+                        cand = a
+                        break  
             if cand is None:
                 return "unknown", None, None, None
 
@@ -1443,7 +1440,8 @@ class InferenceProfiler:
                 rows.append({"kind":"decode_step","name":f"decode_{i:04d}","cat":"inference","t_start_ms":"", "t_end_ms":"", "dur_ms":dt})
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=["kind","name","cat","t_start_ms","t_end_ms","dur_ms"])
-                w.writeheader(); w.writerows(rows)
+                w.writeheader()
+                w.writerows(rows)
         else:
             with open(path + ".json", "w", encoding="utf-8") as f:
                 json.dump(self.result, f, ensure_ascii=False, indent=2)
@@ -1520,7 +1518,8 @@ def dump_param_inventory(model, tag):
                 buckets["other"] += b
         else:
             buckets["other"] += b
-    f = lambda x: f"{x/(1<<30):.2f} GiB"
+    def f(x):
+        return f"{x/(1<<30):.2f} GiB"
     print(f"[PARAMS] {tag}: cpu={f(buckets['cpu'])}, cuda={f(buckets['cuda'])}, meta={f(buckets['meta'])}, other={f(buckets['other'])}")
     if big_cpu:
         big_cpu.sort(key=lambda x:-x[1])
@@ -1601,17 +1600,28 @@ def classify_mode(llama) -> str:
         print(f"[MODE] detected={mode}  (has WSM, ssd={ssd}, disable_cpu_warm={cpu_warm})")
         return mode
     cpu, cuda, meta = 0,0,0
-    for _,p in m.named_parameters():
-        b = p.numel()*p.element_size()
-        if getattr(p, "is_meta", False): meta += b
-        elif p.device.type == "cpu":     cpu  += b
-        elif p.device.type == "cuda":    cuda += b
+    for _, p in m.named_parameters():
+        b = p.numel() * p.element_size()
+
+        if getattr(p, "is_meta", False) or p.device.type == "meta":
+            meta += b
+        elif p.device.type == "cpu":
+            cpu += b
+        elif p.device.type == "cuda":
+            cuda += b
+
     if cuda > 0 and cpu == 0 and meta == 0:
-        print("[MODE] detected=full-gpu"); return "full-gpu"
-    if cpu  > 0 and cuda == 0 and meta == 0:
-        print("[MODE] detected=full-cpu"); return "full-cpu"
-    if meta > 0 and cpu == 0 and cuda == 0:
-        print("[MODE] detected=meta-only"); return "meta-only"
+        print("[MODE] detected=full-gpu")
+        mode = "full-gpu"
+    elif cpu > 0 and cuda == 0 and meta == 0:
+        print("[MODE] detected=full-cpu")
+        mode = "full-cpu"
+    elif meta > 0 and cpu == 0 and cuda == 0:
+        print("[MODE] detected=meta-only")
+        mode = "meta-only"
+    else:
+        print("[MODE] detected=mixed")
+        mode = "mixed"
     print("[MODE] mixed/unrecognized (check PARAMS dump below)")
     return "unknown"
 
@@ -2096,42 +2106,25 @@ def build_output_paths(log_dir: Path, run_id: str, mode: str) -> tuple[Path, Pat
 # ---------- 运行主流程 ----------
 def main():
     global PROFILER
-
-    # 固定目录：自动创建
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 不再使用环境变量；run_id 可附带 RUN_TAG
     base_tag = RUN_TAG.strip() or None
     PROFILER = InferenceProfiler(run_name=base_tag)
 
-    # 基础系统开销收敛
     os.environ.setdefault("OMP_NUM_THREADS",  "8")
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
-    # PYTORCH_CUDA_ALLOC_CONF 已在顶部设置（必须在 import torch 前）
 
-    # ============================================================
-    # 异步滑动窗口 - RTX 5080 (16GB) + 125GB RAM 
-    # ============================================================
-
-    # Warmup 至少需要覆盖: 初始层 + 预取深度 = 12 层
     GPU_AHEAD_LAYERS = 8
     GPU_MAX_GROUPS   = 12
     GPU_WARMUP_LAYERS = 10
     CPU_CACHE_LAYERS = 47# 
-    DEFAULT_BATCH_SIZE  = int(os.getenv("PROMPT_BATCH", "64"))   # 推理 batch size
-    DEFAULT_MAX_GEN_LEN = int(os.getenv("GEN_TOKENS", "32"))    # 每个样本生成 token 数
+    DEFAULT_BATCH_SIZE  = int(os.getenv("PROMPT_BATCH", "64"))   # batch size
+    DEFAULT_MAX_GEN_LEN = int(os.getenv("GEN_TOKENS", "32"))    # 生成 token 数
 
-
-
-    # === H2D 并发控制（PCIe Gen5 + RTX 5080 高带宽配置） ===
-    # PCIe Gen5 x16 带宽: 64GB/s (Gen4的2倍)
-    # 70B模型每组权重~1.5GB → Gen5单次H2D只需~25ms（Gen4的一半）
-    # 更高带宽意味着需要更高并发度才能饱和PCIe，避免流水线空隙
-    os.environ.setdefault("WSM_H2D_BASE_CONCURRENCY",  "32")   #  5→16（Gen5高带宽，基础并发）
-    os.environ.setdefault("WSM_H2D_PREFILL_MULT",      "4")  # Prefill: 32 并发
-    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "2")  #  1.0→1.5（Decode: 24 并发）
-    os.environ.setdefault("WSM_MAX_INFLIGHT_GROUPS",   "128")   #  16→32（Inflight 上限，匹配并发）
-    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "256")   #  48→96（H2D 队列，Gen5需要更深队列）
+    os.environ.setdefault("WSM_H2D_BASE_CONCURRENCY",  "32")   
+    os.environ.setdefault("WSM_H2D_PREFILL_MULT",      "4")  
+    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "2")  
+    os.environ.setdefault("WSM_MAX_INFLIGHT_GROUPS",   "128")  
+    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "256")  
 
     # === 异步逐出机制 ===
     os.environ.setdefault("WSM_EVICT_QUEUE_SIZE",      "96")   # 逐出队列容量
@@ -2142,40 +2135,40 @@ def main():
     os.environ.setdefault("WSM_GPU_AHEAD_GROUPS",      str(GPU_AHEAD_LAYERS))
 
     # Group 级预取深度：prefill 保守，decode aggressive
-    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_PREFILL",  "10")  # prefill 只前瞻少量 group
-    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_DECODE",   "10")  # decode 保持热数据在 GPU  
+    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_PREFILL",  "10")  
+    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH_DECODE",   "10") 
     os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))
-    os.environ.setdefault("WSM_GPU_BEHIND",            "2")    # 保留最近 2 层
+    os.environ.setdefault("WSM_GPU_BEHIND",            "2")    
 
     # === 预取策略 ===
     os.environ.setdefault("WSM_BALANCE_PREFETCH",      "1")
     os.environ.setdefault("WSM_PAIR_AHEAD",            "2")
     os.environ.setdefault("WSM_KIND_AHEAD_CAP",        "2")
-    os.environ.setdefault("WSM_EVICT_FINISHED",        "1")    # 启用完成后逐出
-    os.environ.setdefault("WSM_CPU_EVICT_AFTER_USE",   "0")    # 异步模式下禁用立即逐出
+    os.environ.setdefault("WSM_EVICT_FINISHED",        "1")   
+    os.environ.setdefault("WSM_CPU_EVICT_AFTER_USE",   "0")  
 
     # === 调试与监控 ===
     os.environ.setdefault("WSM_GRP_RETAIN_MS",         "0")
-    os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",     "1")    # 启用异步预加载
-    os.environ.setdefault("WSM_DEBUG_PREFETCH",        "1")    # 启用详细日志
-    os.environ.setdefault("WSM_VERBOSE_MISMATCH",      "0")    # 生产环境关闭
+    os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",     "1")    
+    os.environ.setdefault("WSM_DEBUG_PREFETCH",        "1")  
+    os.environ.setdefault("WSM_VERBOSE_MISMATCH",      "0")   
 
     # === CPU 预取优化（RAM 可容纳 60 层） ===
     os.environ.setdefault("WSM_POOLED_CPU_READ",       "1")
-    os.environ.setdefault("WSM_CPU_PF_WORKERS",        "12")   # CPU 预取线程数（50% CPU）
-    os.environ.setdefault("WSM_REBALANCE_SYNC",        "0")    # 异步重平衡
+    os.environ.setdefault("WSM_CPU_PF_WORKERS",        "12")   
+    os.environ.setdefault("WSM_REBALANCE_SYNC",        "0")  
 
     # === SSD→CPU 流水线 ===
     os.environ.setdefault("WSM_CPU_PREFETCH_DISTANCE", str(CPU_CACHE_LAYERS))   
-    os.environ.setdefault("WSM_SSD_CONCURRENCY",       "12")    # SSD 并发读取
+    os.environ.setdefault("WSM_SSD_CONCURRENCY",       "12") 
 
     # === Prefill 特定优化 ===
-    os.environ.setdefault("PREFILL_CPU_LAYERS",        str(CPU_CACHE_LAYERS))   # Prefill CPU 缓存 50 层
-    os.environ.setdefault("PREFILL_GPU_LAYERS",        str(GPU_WARMUP_LAYERS))  #  6 → 12 层
-    os.environ.setdefault("PREFILL_PREFETCH_DISTANCE", "10")   # Layer 级预取保持稍大，提前准备更多层
-    os.environ.setdefault("DECODE_PREFETCH_DISTANCE",  "4")    # Decode 压小，重心在重叠 token 计算
-    os.environ.setdefault("WSM_WARMUP_LAYERS_GPU",     str(GPU_WARMUP_LAYERS))  #  6 → 12 层
-    os.environ.setdefault("WSM_WRAPAROUND_WARMUP",     str(GPU_WARMUP_LAYERS))  #  6 → 12 层
+    os.environ.setdefault("PREFILL_CPU_LAYERS",        str(CPU_CACHE_LAYERS))   
+    os.environ.setdefault("PREFILL_GPU_LAYERS",        str(GPU_WARMUP_LAYERS))  
+    os.environ.setdefault("PREFILL_PREFETCH_DISTANCE", "10")   
+    os.environ.setdefault("DECODE_PREFETCH_DISTANCE",  "4")   
+    os.environ.setdefault("WSM_WARMUP_LAYERS_GPU",     str(GPU_WARMUP_LAYERS))  
+    os.environ.setdefault("WSM_WRAPAROUND_WARMUP",     str(GPU_WARMUP_LAYERS))  
     
     # chunk & micro-batch 大小（与并发匹配）
     os.environ.setdefault("PREFILL_T_CHUNK", str(CHUNK_SIZE)) 
@@ -2203,10 +2196,10 @@ def main():
     print(f"GPU 预取深度:  {GPU_AHEAD_LAYERS} 组")
     print(f"GPU 组预算:    {GPU_MAX_GROUPS} 组 (最多 ~9GB)")
     print(f"CPU 缓存容量:  {CPU_CACHE_LAYERS} 层 (~79.5GB)")
-    print(f"H2D 并发度:    Prefill 24 | Decode 16")
-    print(f"异步逐出队列:  64 任务")
-    print(f"后台线程池:    6 workers")
-    print(f"CPU 预取线程:  10 workers")
+    print("H2D 并发度:    Prefill 24 | Decode 16")
+    print("异步逐出队列:  64 任务")
+    print("后台线程池:    6 workers")
+    print("CPU 预取线程:  10 workers")
     print("=" * 80)
     print("✅ 异步窗口特性: 逐出/预取/CPU推进 全部在后台线程执行")
     print("✅ 主线程窗口滑动延迟: <1ms (vs 同步模式 ~20ms)")
@@ -2214,7 +2207,6 @@ def main():
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    # 1) 覆盖 pinned/注册池 + KV 池
     with PROFILER.span("apply_runtime_overrides", "setup"):
         apply_runtime_overrides()
     with PROFILER.span("configure_kv_pool", "setup"):
@@ -2222,14 +2214,13 @@ def main():
     with PROFILER.span("probe_after_runtime_clamp", "non_inference"):
         probe("after runtime clamp")
 
-    # 2) WSM（SSD 流式）构造参数
-    PRIME_WINDOW = int(os.getenv("WSM_PRIME_WINDOW", "6"))  # 从环境变量读取，默认6
+    PRIME_WINDOW = int(os.getenv("WSM_PRIME_WINDOW", "6"))  
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
-        "max_cached_layers": CPU_CACHE_LAYERS,         # 必须与 CPU_CAP_VALUE 一致
-        "cpu_cache_layers": CPU_CACHE_LAYERS,          # CPU 环形容量
-        "warmup_layers": max(PRIME_WINDOW, GPU_AHEAD_LAYERS + 2),  #  Fix: 至少预热 GPU_AHEAD + 2 层
+        "max_cached_layers": CPU_CACHE_LAYERS,         
+        "cpu_cache_layers": CPU_CACHE_LAYERS,         
+        "warmup_layers": max(PRIME_WINDOW, GPU_AHEAD_LAYERS + 2),  
         "staging_mb": 64,
         "verbose": True,
         "gpu_max_groups": GPU_MAX_GROUPS,
@@ -2241,7 +2232,7 @@ def main():
     with PROFILER.span("LLaMA.build", "setup"):
         llama = LLaMA.build(
             checkpoints_dir=CKPT_DIR,
-            load_model=False,           # 不把 checkpoint 全载入 CPU
+            load_model=False,           
             device=device,
             max_seq_len=4096,
             max_batch_size=64,
@@ -2258,18 +2249,13 @@ def main():
     with PROFILER.span("probe_after_build", "non_inference"):
         probe("after LLaMA.build")
 
-    # 绑定 WSM 补丁：仅为 profiler 计时，wait_group_ready 的异步逻辑已在 WSM 主类实现
     wsm = getattr(llama, "weight_streaming_manager", None)
     if wsm is not None:
-        # 初始化 pipeline watermark 统计字典
         wsm._pipeline_watermark = {}
-
-        # 包装 wait_group_ready 以添加 profiler 计时
         _patch_wsm_for_profiling(wsm)
         original_wait = wsm.wait_group_ready
         wsm.wait_group_ready = types.MethodType(_wrap_wait_group_ready(original_wait), wsm)
 
-        # 保留 ensure_module_on_gpu 的 CPU stub loader 补丁
         wsm._ensure_module_on_gpu = types.MethodType(_patched_ensure_module_on_gpu, wsm)
         print("[WSM PATCH] Profiler wrapper + CPU stub loader enabled")
 
@@ -2289,7 +2275,7 @@ def main():
 
     PROFILER.wrap_model_forward(llama.model)
 
-    # 4) 读取 prompt + 安全裁剪（max_gen_len=32）
+    # 读取 prompt + 安全裁剪（max_gen_len=32）
     batch_size = DEFAULT_BATCH_SIZE
     max_gen_len = DEFAULT_MAX_GEN_LEN
 
