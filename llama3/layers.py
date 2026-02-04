@@ -1,12 +1,12 @@
 import contextlib
-import math, os
+import os
 from typing import Optional, List, Dict
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch
+import torch.nn as nn
 import threading
 import logging
 from contextlib import contextmanager
 import time
-from torch.backends.cuda import sdp_kernel as sdpa_kernel
 # 配置日志
 logger = logging.getLogger(__name__)
 
@@ -291,13 +291,6 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, t
     freqs = torch.outer(m, theta_i)
     return torch.polar(torch.ones_like(freqs), freqs)
 
-# def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor) -> torch.Tensor:
-#     b, l, h, d = x.shape
-#     x_ = x.float().reshape(b, l, h, d // 2, 2)
-#     x_complex = torch.view_as_complex(x_)
-#     freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)
-#     out = torch.view_as_real(x_complex * freqs_complex)
-#     return out.reshape(b, l, h, d).type_as(x)
 def apply_rotary_embeddings(x: torch.Tensor,
                             freqs_complex: torch.Tensor,
                             start_pos: int = 0) -> torch.Tensor:
@@ -700,124 +693,6 @@ class SelfAttention(nn.Module):
         return out
 
 
-    
-    # def _forward_prefill_micro_batch(
-    #     self,
-    #     x: torch.Tensor,
-    #     start_pos: int,
-    #     freqs_complex: torch.Tensor,
-    #     micro_b: int,
-    # ) -> torch.Tensor:
-    #     """
-    #     只在 prefill 阶段(start_pos == 0)使用的按 batch 维 micro-batch 的 attention 实现。
-    #     - 整个前向仍然算完 B 个样本的输出，
-    #     - 但每次只在 GPU 上放 micro_b 个样本的 Q/K/V 和 attention，
-    #       其余样本顺序串行，从而降低峰值显存。
-    #     - KV 缓存在计算完每个 micro-batch 时写入 offloader（使用 batch_offset）。
-    #     """
-    #     assert start_pos == 0, "_forward_prefill_micro_batch 只用于 prefill"
-
-    #     import torch.nn.functional as F
-    #     from .global_state_tracker import get_global_tracker
-
-    #     device = x.device
-    #     dtype = x.dtype
-    #     B, T, _ = x.shape
-
-    #     if B <= micro_b:
-    #         # B 本身就不大，没必要走这个分支
-    #         raise RuntimeError("micro_b >= batch_size, 不应该进 _forward_prefill_micro_batch")
-
-    #     offloader = getattr(self, "offloader", None)
-    #     if offloader is None:
-    #         raise RuntimeError("需要 KVOffloader 才有意义（要把 prefill 的 KV 存起来）")
-
-    #     # 当前“批次 id”用于 global tracker 统计（不是 batch 维索引）
-    #     tracker = get_global_tracker()
-    #     if tracker:
-    #         batch_idx = tracker.current_batch
-    #     else:
-    #         batch_idx = 0
-
-    #     # 确保本层 attn 权重已经在 CUDA 上（走你原来封装好的逻辑）
-    #     self._ensure_weights_cuda()
-
-    #     # 结果缓冲区：最终返回 [B, T, dim]
-    #     out = torch.empty(B, T, self.n_heads_q * self.head_dim, dtype=dtype, device=device)
-
-    #     # 是否使用 causal mask
-    #     is_causal = getattr(self, "apply_causal_mask", True)
-
-    #     # 为了用 Flash Attention，统一转成 (B, H, T, D)
-    #     def _repeat_kv_for_q_heads(k_or_v: torch.Tensor) -> torch.Tensor:
-    #         # k_or_v: [mb, T, n_kv_heads, head_dim]
-    #         k_or_v = k_or_v.transpose(1, 2).contiguous()  # [mb, n_kv_heads, T, D]
-    #         if self.n_rep != 1:
-    #             # 重复 KV head 到 Q head
-    #             k_or_v = k_or_v.repeat_interleave(self.n_rep, dim=1)  # [mb, n_heads_q, T, D]
-    #         return k_or_v
-
-    #     # 主循环：沿 batch 维分块
-    #     for b0 in range(0, B, micro_b):
-    #         b1 = min(B, b0 + micro_b)
-    #         mb = b1 - b0
-    #         xb = x[b0:b1]                     # [mb, T, dim]
-
-    #         # -------- Q/K/V 投影 + RoPE（只在这一小块上）--------
-    #         # 注意：这里不再一次性对全 B 做 Q/K/V，从而避免大 tensor
-    #         q = self.wq(xb).view(mb, T, self.n_heads_q, self.head_dim)
-    #         k = self.wk(xb).view(mb, T, self.n_kv_heads, self.head_dim)
-    #         v = self.wv(xb).view(mb, T, self.n_kv_heads, self.head_dim)
-
-    #         # RoPE：仍然用你文件里已经优化过的 apply_rotary_embeddings（它内部有 B 维 chunk）
-    #         q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
-    #         k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
-
-    #         # -------- 把当前 micro-batch 的 KV 写入 offloader（用 batch_offset=b0）--------
-    #         # 这样每个样本的 KV 都被放在 [batch_offset : batch_offset+mb) 这一段，
-    #         # 整体 pinned KV 的 batch 维大小仍然是 max_batch（比如 64/128）
-    #         for t in range(T):
-    #             token_idx = start_pos + t
-    #             blk_idx   = token_idx // self.block_sz
-    #             offloader.push(
-    #                 layer=self.layer_id,
-    #                 blk=blk_idx,
-    #                 k=k[:, t, :, :],           # [mb, n_kv_heads, head_dim]
-    #                 v=v[:, t, :, :],
-    #                 token_idx=token_idx,
-    #                 batch_idx=batch_idx,       # 统计用
-    #                 batch_offset=b0,           # 关键：在 KV 中的 batch 偏移
-    #             )
-
-    #         # -------- 注意力计算（仅用当前 micro-batch 的 Q / K / V）--------
-    #         # 这里不从 offloader 取 KV，而是直接用刚算出的 k/v，
-    #         # 因为 prefill 阶段 K/V 就是当前层刚算出来的值
-    #         q_t = q.transpose(1, 2)                      # [mb, n_heads_q, T, D]
-    #         k_full = _repeat_kv_for_q_heads(k)           # [mb, n_heads_q, T, D]
-    #         v_full = _repeat_kv_for_q_heads(v)           # [mb, n_heads_q, T, D]
-
-    #         # Flash Attention（和你原来的实现保持一致）
-    #         from contextlib import nullcontext
-    #         try:
-    #             from torch.backends.cuda import sdp_kernel as sdpa_kernel
-    #             sdpa_ctx = sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True)
-    #         except Exception:
-    #             sdpa_ctx = nullcontext()
-
-    #         with sdpa_ctx:
-    #             attn_out = torch.nn.functional.scaled_dot_product_attention(
-    #                 q_t, k_full, v_full,
-    #                 attn_mask=None,
-    #                 dropout_p=0.0,
-    #                 is_causal=is_causal,
-    #             )  # [mb, n_heads_q, T, D]
-
-    #         # 回到 [mb, T, dim]
-    #         attn_out = attn_out.transpose(1, 2).contiguous().view(mb, T, self.n_heads_q * self.head_dim)
-    #         out[b0:b1] = self.wo(attn_out)
-
-    #     return out
-
     def forward(
         self,
         x: torch.Tensor,
@@ -829,9 +704,6 @@ class SelfAttention(nn.Module):
         batch_offset: int = 0,
     ) -> torch.Tensor:
 
-        # ============================================================
-        # ⭐ 回绕通知 + 事件等待（彻底不兜底）
-        # ============================================================
         wm = getattr(self, "weight_manager", None)
  
         # 这不会改变 WSM 的权重流式行为，只是防止激活回到 CPU
@@ -843,7 +715,6 @@ class SelfAttention(nn.Module):
             )
             x = x.to(target_device, non_blocking=True)
 
-        # ⭐⭐⭐ 防御式检查：激活必须在 CUDA 上（早失败，避免后续隐式同步）
         if not x.is_cuda:
             raise RuntimeError(
                 f"[SelfAttention L{self.layer_id}] Input activation is on {x.device}, expected CUDA. "
@@ -873,17 +744,6 @@ class SelfAttention(nn.Module):
         assert x.dim()==3, f"x dim={x.dim()}, shape={x.shape}"
         bsz, seqlen, _ = x.shape
         
-        # micro_env = os.getenv("ATTN_MICRO_B", "0").strip()
-        # micro_b = int(micro_env) if micro_env.isdigit() else 0
-
-        # # 只在 prefill（start_pos==0）且 B > micro_b 时启用
-        # if start_pos == 0 and micro_b > 0 and micro_b < bsz:
-        #     return self._forward_prefill_micro_batch(
-        #         x=x,
-        #         start_pos=start_pos,
-        #         freqs_complex=freqs_complex,
-        #         micro_b=micro_b,
-        #     )
         is_prefill = seqlen > 1
         is_decode  = (seqlen == 1 and start_pos > 0)
 
@@ -901,14 +761,10 @@ class SelfAttention(nn.Module):
         _ensure_cpu_scalar_attr(self, "attn_us")
         _ensure_cpu_scalar_attr(self, "total_forward_us")
 
-        # ⭐ 调试日志：仅当环境变量启用时输出（避免 prefill 阶段 CPU 瓶颈）
         _verbose = os.getenv("ATTN_VERBOSE_LOG", "0") == "1"
         if _verbose:
             print(f"[ATTN] Layer {self.layer_id} forward starting...")
 
-        # ============================================================
-        # 1) ⭐⭐⭐ P0 FIX: 先预取(异步) → 再等待(事件依赖)，实现IO/计算overlap
-        # ============================================================
         wm = getattr(self, "weight_manager", None)
         in_use = False
         try:
@@ -916,8 +772,6 @@ class SelfAttention(nn.Module):
                 wm._mark_group_in_use(self.layer_id, "attn")
                 in_use = True
 
-            # ⭐⭐⭐ STEP 1: 立即发起异步预取（不等待，让H2D与后续计算overlap）
-            # 这是关键优化：预取必须在wait_event之前，否则零overlap
             try:
                 if wm is not None and hasattr(wm, "prefetch_group_async"):
                     # (1) 配对预取：当前层的 FFN（将与当前attn计算overlap）
@@ -930,8 +784,6 @@ class SelfAttention(nn.Module):
             except Exception:
                 pass
 
-            # ⭐⭐⭐ STEP 2 & 3: 确保当前attn权重就绪（强制等待，保证权重在GPU）
-            # 优化：先尝试直接取事件建立依赖，极端情况再兜底 wait_group_ready
             stream = self.compute_stream or torch.cuda.current_stream()
             evt = None
             try:
@@ -940,12 +792,6 @@ class SelfAttention(nn.Module):
             except Exception:
                 evt = None
 
-            # if evt is not None:
-            #     stream.wait_event(evt)  # 非阻塞，仅建立依赖
-            # else:
-            #     # 极端兜底：沿用原 wait_group_ready（内部同样是 wait_event，但会触发补救逻辑）
-            #     if wm is not None and hasattr(wm, "wait_group_ready"):
-            #         wm.wait_group_ready(self.layer_id, "attn", compute_stream=stream)
             if evt is not None:
                 stream.wait_event(evt)  # GPU 侧依赖
             else:
@@ -973,7 +819,6 @@ class SelfAttention(nn.Module):
                 try: wm.pin_group(self.layer_id, "ffn", reason="pair")
                 except Exception: pass
 
-            # ⭐ 可选：等待 KV 块 ready 事件（如果有预取）
             # 在 decode 阶段等待本层所需的 KV 块 H2D 完成
             if is_decode and self.offloader is not None and hasattr(self.offloader, "wait_blocks_ready"):
                 # 计算本层需要的块：decode 时使用最近窗口 tokens
@@ -1957,7 +1802,6 @@ class EncoderBlock(nn.Module):
         import torch
         from llama3 import stream_mnt
 
-        # ⭐⭐⭐ 修复：激活应该跟随权重设备，而不是 self.device（后者可能在 OOM 时被改成 "cpu"）
         # 使用 attention_norm.weight 的设备作为目标设备（因为它是第一个会用到的权重）
         target_device = self.attention_norm.weight.device
         dtype = getattr(self, "param_dtype", torch.bfloat16)
@@ -1985,7 +1829,6 @@ class EncoderBlock(nn.Module):
         if wm is not None and hasattr(wm, "note_compute_advance"):
             wm.note_compute_advance(self.layer_id)
 
-        # ⭐ 只检查激活是否在 CUDA 上（权重可能在 SSD streaming 模式下动态加载）
         if x.device.type != "cuda":
             raise RuntimeError(f"Layer {self.layer_id}: input activation must be on CUDA, got {x.device}")
 

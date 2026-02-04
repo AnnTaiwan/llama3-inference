@@ -1,47 +1,6 @@
 
 from __future__ import annotations
 
-"""
-kv_offload_fixed.py
-
-修复点（与原版对照）
-------------------
-1) **单例化 & 幂等初始化**：KVOffloader 覆盖 __new__ 实现进程级单例，__init__ 支持幂等，避免
-   每层构造时启动多份后台线程/队列（对应“问题1：跨层共享但缺乏同步保护”）。
-
-2) **按块锁（per-(L,B)）**：新增 self._blk_locks[L][B]，所有对 k_cpu/v_cpu、gpu_k/gpu_v、on_ssd、
-   事件表的读写都在相应的块锁保护下进行，消除无锁读写（对应“问题2、问题4、问题5”的根因）。
-
-3) **原子发布（atomic publish）**：_alloc_block() 采用“在局部变量中完成分配/reshape/zero，再一次性
-   发布到 self.k_cpu/v_cpu”，并在块锁内双检，消除检查与赋值之间的竞态窗口（问题4）。
-
-4) **push() / _load_from_ssd() 并发**：push() 在块锁中安排 D2H 拷贝，并记录 per-block D2H 事件；
-   _spill_to_ssd() 在释放 pinned 前会非阻塞轮询该事件；_load_from_ssd() 也在块锁内执行，确保和
-   push 对同一 (L,B) 不会交错覆盖（问题3）。
-
-5) **prefetch_async() 写 GPU 缓存的同步**：对每个块在拷贝之后**单独记录 per-block CUDA Event**
-   到 self._blk_ready_evt[(L,B)]，fetch()/wait_blocks_ready() 只等待该块事件；组级事件仍保留在
-   self._prefetch_map 中用于整组快拼，但不再复用“同一个 event 给多个块”（问题6、问题5）。
-
-6) **fetch() 的多流友好 & 全 GPU 快路径**：新增 stream 形参；当所有块都已在 GPU 且形状匹配时，
-   仅在 compute 流上等待块事件并直接拼接；否则按需补齐 SSD→DRAM、DRAM→HBM，并在 H2D 流上
-   记录 per-block 事件，主流通过 wait_stream() 桥接，避免隐性同步（提升正确性与吞吐）。
-
-7) **零拷贝加载（可选）**：_load_from_ssd() 优先尝试对齐的 pinned-uint8 直接读取（若后端实现
-   `read_into_pinned_aligned`），不可用则回退到 legacy 路径，保证兼容性。
-
-8) **写入限速与线程关闭**：保留原有 writer/packer 节流逻辑与关停流程，同时在单例上只启动一份
-   后台线程，避免多实例竞争 IO。
-
-本文件只依赖你工程中的：
-- .SSDBacked.RawBlockKVBackend
-- .config.KVCacheArgs
-- .global_state_tracker.get_global_tracker / init_global_tracker / StorageType
-
-若你的后端未实现 read_into_pinned_aligned，本代码会自动走回退路径。
-
-"""
-
 import threading
 import time
 import collections
@@ -50,7 +9,7 @@ import os
 import gc
 from collections import OrderedDict
 from queue import Empty, Queue, Full
-from typing import List, Iterable, Tuple, Union, Optional, Dict
+from typing import List, Tuple, Union, Optional, Dict
 
 import numpy as np
 import torch
@@ -63,9 +22,6 @@ from .global_state_tracker import get_global_tracker, init_global_tracker, Stora
 BLOCK = 256  # tokens / block
 
 
-# ============================================================================
-# TTL-LRU 容器：防止预取记录无限增长
-# ============================================================================
 class _TTLDict(OrderedDict):
     """
     带 TTL 和容量限制的字典，用于防止 prefetch map 内存泄漏。

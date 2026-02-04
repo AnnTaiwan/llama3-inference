@@ -10,7 +10,7 @@ import time
 import logging
 from typing import Optional, Dict, Any, Callable, List, Tuple
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 

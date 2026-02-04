@@ -12,7 +12,6 @@ class LayerInfo:
 
 @dataclass
 class KVCacheArgs:
-    # ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
     ssd_size_gb: int = 500
     dram_limit_gb: float = 8
     ssd_device_path: str = "/dev/nvme0n1p4"  # Raw block device path for KV cache
@@ -246,7 +245,6 @@ class RuntimeConfig:
     policy: StreamingPolicyConfig = field(default_factory=StreamingPolicyConfig)
     system: SystemStabilityConfig = field(default_factory=SystemStabilityConfig)
     monitor: MonitoringConfig = field(default_factory=MonitoringConfig)
-    # 复用你已有的 KV 配置；若需要 KV 独立 QD，可在这里扩展字段或在 KV 层覆写
     kv_cache: 'KVCacheArgs' = field(default_factory=lambda: KVCacheArgs())
 
 def _update_dataclass(dc_obj, updates: Dict[str, Any]):

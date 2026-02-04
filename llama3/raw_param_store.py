@@ -71,12 +71,6 @@ class ParamStore:
       - fetch_layer_async/offload_layer_async: 异步版本，利用线程池并行 I/O。
       - fetch_layer_batch: 批量加载多层。
 
-    改进点:
-      1. ✅ 复用 staging buffer，避免频繁分配 pinned memory
-      2. ✅ 异步 I/O 支持 (线程池)
-      3. ✅ 批量操作优化
-      4. ✅ 更详细的错误处理
-      5. ✅ 与 WeightStreamingManager 集成辅助方法
 
     用法：
       store = ParamStore("/data1/model.runtime_manifest.json", rw=True, staging_mb=32)

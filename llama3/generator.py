@@ -653,7 +653,7 @@ class LLaMA:
 
             llama.streams = get_streams(device)
             llama._integrate_wsm_to_layers(wsm, llama.streams)
-            # 🔥 Initial non-blocking warmup of first few groups
+            #  Initial non-blocking warmup of first few groups
             try:
                 if hasattr(wsm, "warmup_groups_prefetch"):
                     wsm.warmup_groups_prefetch(
@@ -706,7 +706,7 @@ class LLaMA:
                 llama._configure_preload_mode(cfg)
             elif m == "full" and device.startswith("cuda"):
                 try:
-                    # ★ 先设置 device 和 param_dtype，移动核心组件
+                    #  先设置 device 和 param_dtype，移动核心组件
                     llama._configure_core_components()
                     # 再移动整个模型到 GPU
                     llama.model = llama.model.to(device)
@@ -727,7 +727,7 @@ class LLaMA:
                     llama._configure_weight_streaming(streaming_config or {})
                 elif device.startswith("cuda"):
                     try:
-                        # ★ 先设置 device 和 param_dtype，移动核心组件
+                        #  先设置 device 和 param_dtype，移动核心组件
                         llama._configure_core_components()
                         # 再移动整个模型到 GPU
                         llama.model = llama.model.to(device)
@@ -741,7 +741,7 @@ class LLaMA:
         elif device.startswith("cuda"):
             # 传统的全量加载模式
             try:
-                # ★ 先设置 device 和 param_dtype，移动核心组件
+                #  先设置 device 和 param_dtype，移动核心组件
                 llama._configure_core_components()
                 # 再移动整个模型到 GPU
                 llama.model = llama.model.to(device)

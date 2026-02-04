@@ -24,9 +24,9 @@ os.environ["WSM_NO_FALLBACK"] = "1"
 
 #  启用层级性能 profiling（CUDA timer 统计 attn/ffn/kv_fetch 等详细时间）
 os.environ["LLM_PROFILE"] = "1"
-CHUNK_SIZE = int(os.environ.setdefault("PREFILL_T_CHUNK", "512"))
-MIRCO_BATCH_SIZE  = os.environ.setdefault("MIRCO_BATCH_SIZE", "8")
-ATTN_MICRO_B = os.environ.setdefault("ATTN_MICRO_B", "8")
+CHUNK_SIZE = int(os.environ.setdefault("PREFILL_T_CHUNK", "512")) # prefill 分块大小
+MIRCO_BATCH_SIZE  = os.environ.setdefault("MIRCO_BATCH_SIZE", "8") # micro batch size
+ATTN_MICRO_B = os.environ.setdefault("ATTN_MICRO_B", "8") # attention micro batch size
 import torch  # noqa: E402
 
 # Optional NVTX for GPU decode-step ranges

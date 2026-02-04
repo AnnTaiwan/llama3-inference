@@ -1,8 +1,7 @@
 import torch
-import psutil
 import time
 import logging
-from typing import Optional, Callable, Any, Dict
+from typing import  Callable, Any, Dict
 from contextlib import contextmanager
 from functools import wraps
 
