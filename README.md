@@ -79,3 +79,25 @@
 * 要看inference的流程直接從 main開始看就好了
 * 參數配置就不多說了
 * 主要是對prompt的處理部分, 裁剪和batch的部分可能需要仔細看一下
+
+## `generate_manifest.py`
+* 這個是生產model使用raw block device的初始化腳本
+* 具體用法在code中都有, 只需要按照步驟就會生成了
+```
+def _hf_to_internal_name(name: str) -> str:
+    n = name
+    if n.startswith("model."): n = n[len("model."):]
+    n = n.replace(".self_attn.q_proj.", ".attention.wq.")
+    n = n.replace(".self_attn.k_proj.", ".attention.wk.")
+    n = n.replace(".self_attn.v_proj.", ".attention.wv.")
+    n = n.replace(".self_attn.o_proj.", ".attention.wo.")
+    n = n.replace(".input_layernorm.", ".attention_norm.")
+    n = n.replace(".post_attention_layernorm.", ".ffn_norm.")
+    n = n.replace(".mlp.gate_proj.", ".feed_forward.w1.")
+    n = n.replace(".mlp.up_proj.",   ".feed_forward.w3.")
+    n = n.replace(".mlp.down_proj.", ".feed_forward.w2.")
+    if n == "model.embed_tokens.weight": n = "embed_tokens.weight"
+    if n == "lm_head.weight": n = "output.weight"
+    return n
+```
+不同model的這個部分肯定不一樣, 這個要看那個model的結構要自己改
