@@ -321,11 +321,8 @@ class WeightStreamingManager:
         self._pcie_ema = 0.0
         self._ema_alpha = 0.2
         self._last_h2d_ms = 0.0
-        # 可选：外部 KV Offloader（若主程序传入，可用于触发"暂停写"）
         self.kv_offloader = None
 
-        # ⭐ 信用/配额机制：限制 inflight 组数，避免 H2D 队列过载（FlexGen credit-based）
-        # 典型值：2 * prefetch_distance，即允许预取窗口内的组都处于 inflight
         _max_inflight_env = int(os.getenv("WSM_MAX_INFLIGHT_GROUPS", "0"))
         self.max_inflight_groups = _max_inflight_env or (2 * max(1, self.prefetch_distance))
         if getattr(self, "verbose", False):
@@ -352,13 +349,11 @@ class WeightStreamingManager:
         
 
         # 滑动窗口 + 回滞参数
-        # ★ 关键修复: cpu_cache_cap 应该使用已解析的 self.cpu_cache_layers（而非参数）
         env_cap = os.getenv("WSM_CPU_CACHE_CAP_LAYERS")
         if env_cap is not None:
             self.cpu_cache_cap = int(env_cap)
             print(f"[WSM] Using WSM_CPU_CACHE_CAP_LAYERS from env: {self.cpu_cache_cap}")
         else:
-            # ✅ 使用已经从环境变量更新后的 self.cpu_cache_layers
             self.cpu_cache_cap = self.cpu_cache_layers
             print(f"[WSM] Using cpu_cache_layers (final value): {self.cpu_cache_cap}")
 
@@ -498,7 +493,6 @@ class WeightStreamingManager:
             self._initialize_ssd_backend(ssd_manifest_path, staging_mb)
 
         # ---- H2D 并发闸门（必须在 warmup 之前初始化）----
-        # ✅ P0-2: 自适应并发控制（使用令牌持有器而非固定 Semaphore）
         self._h2d_base_concurrency = int(os.getenv("WSM_H2D_BASE_CONCURRENCY", "2"))
         self._h2d_prefill_multiplier = float(os.getenv("WSM_H2D_PREFILL_MULT", "2.0"))
         self._h2d_decode_multiplier = float(os.getenv("WSM_H2D_DECODE_MULT", "1.0"))
@@ -596,9 +590,9 @@ class WeightStreamingManager:
 
     
         # --- within WeightStreamingManager.__init__ ---
-        # ❌ 删除第三次重复赋值：gpu_max_groups 已在前面统一设置
+        # 删除第三次重复赋值：gpu_max_groups 已在前面统一设置
         self.target_gpu_groups   = int(os.getenv("WSM_TARGET_GPU_GROUPS", self.gpu_max_groups / 2))
-        # ✅ 已在初始化早期统一解析 cpu_cache_layers，此处不再覆盖
+        # 已在初始化早期统一解析 cpu_cache_layers，此处不再覆盖
         # 基于最终值重新计算依赖配置（防止 blocks 数量变化导致的不一致）
         self.target_cpu_layers = min(self.prefill_cpu_layers, self.cpu_cache_layers, len(self.blocks))
         # 是否允许在溢出第二轮收缩时强制踢掉"非 IN_USE 的 pinned 组"
@@ -679,7 +673,7 @@ class WeightStreamingManager:
                 layer_idx, group, wait_event = task
                 key = (layer_idx, group)
 
-                # ✅ 事件驱动：只在必要时等待（在后台线程，不阻塞主线程）
+                # 事件驱动：只在必要时等待（在后台线程，不阻塞主线程）
                 if wait_event is not None:
                     try:
                         # synchronize() 会阻塞但只阻塞后台线程
@@ -1259,7 +1253,6 @@ class WeightStreamingManager:
     def gpu_frontier(self) -> int:
         """
         返回"GPU 已驻留或在飞"组集合的环上最大层号，用于驱动 CPU 环窗。
-        ★ 修复：加锁访问 _gpu_group_ring 和 _gpu_group_inflight
         """
         with self._group_lock:
             allL = [L for (L, _G) in list(self._gpu_group_ring)]
@@ -1275,7 +1268,7 @@ class WeightStreamingManager:
     # ========== 修改 5: 删除rebalance_and_topoff ==========
     def rebalance_and_topoff(self, current_layer: int) -> None:
         """
-        ⚠️ 已废弃：GPU 窗口管理已迁移到 _slide_window_forward。
+        已废弃：GPU 窗口管理已迁移到 _slide_window_forward。
         如需，可仅用于环形回绕的 CPU 预热处理。
         """
         if not getattr(self, "ssd_enabled", False):
@@ -1329,27 +1322,22 @@ class WeightStreamingManager:
         offs = int(self.cpu_ring_offset)
         cap  = int(self.cpu_cache_cap)
 
-        # ⭐ 关键修复：确保当前层总是在窗口内
         # 策略1: 如果窗口容量 ≥ 总层数，包含所有层（无需环形）
         if cap >= nL:
             anchor = 0
             target = set(range(nL))
         else:
             # 策略2: 窗口从当前层开始，覆盖 cap 层（环形）
-            # ✅ 修复：anchor 使用 (i + offs)，但强制包含当前层
             anchor = (i + offs) % nL
             target = set(self._ring_range(anchor, cap))
-            # ✅ 双重保险：无论 offset 如何，强制包含当前层和前后几层
             # 确保 GPU 需要的层（i-back_margin 到 i+gpu_ahead）都在窗口内
             safety_margin = max(int(getattr(self, 'cpu_back_margin', 4)), 2)
             gpu_ahead = max(int(getattr(self, 'gpu_ahead_layers', 4)), 2)
             for delta in range(-safety_margin, gpu_ahead + 1):
                 target.add((i + delta) % nL)
 
-        # ⭐ 关键修复：更新 cpu_win_base，确保 _layer_in_cpu_window 使用最新窗口
         self.cpu_win_base = anchor
 
-        # ⭐ 关键修复：将 target 中的所有层添加到保护集，避免 worker 拒绝它们
         with self._cpu_lock:
             if not hasattr(self, '_cpu_protect_set'):
                 self._cpu_protect_set = set()
@@ -1377,7 +1365,6 @@ class WeightStreamingManager:
                     self._inflight_cpu_layers.discard(L)
                 break
         # 淘汰环外层，保持 DRAM 环窗
-        # ⭐ 修复：收集GPU上resident的层，避免驱逐它们
         gpu_resident_layers = set()
         for (layer, grp), state in self._group_state.items():
             if state in ("RESIDENT", "INFLIGHT"):
@@ -1498,7 +1485,6 @@ class WeightStreamingManager:
     def _advance_cpu_window(self, cur_layer: int):
         """
         只前移，不后退；确保当前层在窗口内
-        ★ 修复: 窗口应该包含当前层，而不是滞后
         """
         # 计算窗口基准：确保 cur_layer 在窗口内，且尽量靠前
         # window = [base, base+cap-1]
@@ -1528,7 +1514,6 @@ class WeightStreamingManager:
         """
         debug = getattr(self, "debug_prefetch", False)
         try:
-            # ✅ 在环形模式下，直接用环形的调度/确保，避免线性 [L0,L1] 语义干扰 wrap 行为
             if getattr(self, "cpu_ring_mode", False):
                 if debug:
                     print(f"[WSM WINDOW ASYNC] (ring) ensure cpu window around L{current_layer}")
@@ -1569,7 +1554,6 @@ class WeightStreamingManager:
     def _ensure_cpu_window(self):
         """
         确保滑动窗口内的层都已加载到 CPU cache
-        ★ 关键修复: 先逐出窗口外的层(跳过保护层)，再加载缺失层，保持容量恒定
         """
         L0, L1 = self._target_cpu_window()
 
@@ -1577,12 +1561,9 @@ class WeightStreamingManager:
             print(f"[WSM DEBUG] _ensure_cpu_window: window=[{L0}, {L1}], cursor={self._cpu_pf_cursor}, "
                   f"win_base={self.cpu_win_base}, cache_size={len(self.cpu_cache)}")
 
-        # ★ 先清理窗口外的层（主动逐出，跳过保护）
-        # ⭐ 修复：使用环形窗口判断，并保护GPU resident层
         base = int(getattr(self, "cpu_win_base", 0))
         cap = int(getattr(self, "cpu_cache_cap", 40))
 
-        # ⭐ 修复：收集GPU上resident的层，避免驱逐它们
         gpu_resident_layers = set()
         for (layer, grp), state in self._group_state.items():
             if state in ("RESIDENT", "INFLIGHT"):
@@ -1609,7 +1590,7 @@ class WeightStreamingManager:
                 self.cpu_cache.pop(layer_id, None)
             self._cpu_cached_layers.discard(layer_id)
 
-        # ★ 修复: 游标只能在窗口内移动
+        #  游标只能在窗口内移动
         if self._cpu_pf_cursor > L1:
             if getattr(self, "verbose", False):
                 print(f"[WSM DEBUG] Cursor {self._cpu_pf_cursor} > window end {L1}, resetting to {L0}")
@@ -1628,7 +1609,7 @@ class WeightStreamingManager:
         # 按序加载缺失层（从游标位置开始）
         for L in range(self._cpu_pf_cursor, L1 + 1):
             if L not in self.cpu_cache:
-                # ★ 关键: 加载前检查容量，必要时先腾出空间(跳过保护层)
+                # 加载前检查容量，必要时先腾出空间(跳过保护层)
                 while len(self.cpu_cache) >= self.cpu_cache_cap:
                     evict_layer = None
                     # 找到第一个非保护层
@@ -1712,11 +1693,9 @@ class WeightStreamingManager:
         # 扫描缓存，逐出窗口外的层
         layers_to_evict = []
 
-        # ⭐ 修复：使用环形窗口判断
         base = int(getattr(self, "cpu_win_base", 0))
         cap = int(getattr(self, "cpu_cache_cap", 40))
 
-        # ⭐ 修复：收集GPU上resident的层，避免驱逐它们
         gpu_resident_layers = set()
         for (layer, grp), state in self._group_state.items():
             if state in ("RESIDENT", "INFLIGHT"):
@@ -1725,7 +1704,6 @@ class WeightStreamingManager:
         for lyr in list(self.cpu_cache.keys()):
             if (len(self.cpu_cache) + incoming - len(layers_to_evict)) <= target_max:
                 break
-            # ⭐ 只踢窗口外 + 非保护层 + 非GPU resident层（使用环形判断）
             in_window = self._ring_contains(base, lyr, cap)
             if (not in_window) and (lyr not in self._cpu_protect_set) and (lyr not in gpu_resident_layers):
                 layers_to_evict.append(lyr)
@@ -1750,11 +1728,8 @@ class WeightStreamingManager:
             print(f"[WSM] Evicting {k} CPU layers, window=[{L0}, {L1}], cache_size={len(self.cpu_cache)}")
 
         # Phase 1: 优先踢窗口外的层（跳过保护层）
-        # ⭐ 修复：使用环形窗口判断
         base = int(getattr(self, "cpu_win_base", 0))
         cap = int(getattr(self, "cpu_cache_cap", 40))
-
-        # ⭐ 修复：收集GPU上resident的层，避免驱逐它们
         gpu_resident_layers = set()
         for (layer, grp), state in self._group_state.items():
             if state in ("RESIDENT", "INFLIGHT"):
@@ -1764,7 +1739,6 @@ class WeightStreamingManager:
         for L in list(self.cpu_cache.keys()):
             if evicted >= k:
                 break
-            # ⭐ 使用环形判断 + 保护GPU resident层
             in_window = self._ring_contains(base, L, cap)
             if (not in_window) and (L not in self._cpu_protect_set) and (L not in gpu_resident_layers):
                 layers_to_evict.append(L)
@@ -1962,7 +1936,6 @@ class WeightStreamingManager:
 
         nvtx.range_pop()
 
-        # ★ 修复 5: 移除 inflight 标记
         with self._inflight_lock:
             self._inflight_cpu_layers.discard(layer_idx)
 
@@ -2029,7 +2002,6 @@ class WeightStreamingManager:
         if not self.ssd_enabled:
             return
 
-        # ⭐ 检查是否使用环形窗口模式（CPU cache < 总层数）
         # 环形窗口模式下，prefetch_distance=0 表示"使用组级预取，不使用整层预取"
         # 而不是"把所有权重都放在DRAM"
         ring_mode = os.getenv("WSM_CPU_RING_MODE", "0") == "1"
@@ -2132,7 +2104,6 @@ class WeightStreamingManager:
     def _schedule_cpu_prefetch(self, current_layer: int):
         """
         滑动窗口预取：只在当前层接近窗口末尾时推进窗口
-        ★ 关键修复: 窗口应该平滑滑动，而不是跳跃式推进
         """
         if not self.ssd_enabled:
             return
@@ -2142,10 +2113,7 @@ class WeightStreamingManager:
                 self._ensure_cpu_ring_window(current_layer)
                 
         else:
-
             L0, L1 = self._target_cpu_window()
-
-            # ★ 修复: 只在当前层超出窗口或接近末尾时，推进窗口 1 层
             # 这样窗口会平滑滑动：[0,49] → [1,50] → [2,51] → ...
             if current_layer > L1 or (current_layer >= L1 - 5):
                 # 计算新的窗口基准：确保当前层在窗口内，但只推进必要的量
@@ -2168,30 +2136,16 @@ class WeightStreamingManager:
 
             # # 确保窗口内的层都已加载
             # self._ensure_cpu_window()
-            
-            # 不在前向线程里做 SSD 同步读！
-            # 仅推进窗口基准与“缺失层排队”，由 _cpu_prefetch_worker 后台加载
+
             self._advance_cpu_window_by_compute(current_layer)
 
 
     def wait_for_preload_ready(self, timeout: float = 300.0) -> bool:
-        """
-        等待预加载完成：GPU有target_gpu_layers层，CPU有target_cpu_layers层
-        ★ 修复 9: 支持跳过等待，允许边跑边滚动预取
-
-        Args:
-            timeout: 最大等待时间（秒）
-
-        Returns:
-            bool: 是否在超时前完成预加载
-        """
         import time
-
-        # ★ 修复 9: 检查环境变量，允许跳过预加载等待
         skip_wait = os.getenv("WSM_SKIP_PRELOAD_WAIT", "0") == "1"
         if skip_wait:
             if self.verbose:
-                print("[WSM] ⚡ WSM_SKIP_PRELOAD_WAIT=1: Skipping preload wait, will prefetch on-the-fly")
+                print("[WSM] WSM_SKIP_PRELOAD_WAIT=1: Skipping preload wait, will prefetch on-the-fly")
             return True
 
         # 从环境变量读取 timeout（允许缩短）
@@ -2241,10 +2195,7 @@ class WeightStreamingManager:
 
             time.sleep(0.1)
 
-        # ★ 修复 9: 超时时给出建议
         print(f"[WSM] ⚠️  Preload timeout after {timeout}s: GPU {resident_layers}/{self.target_gpu_layers}, CPU {len(self.cpu_cache)}/{self.target_cpu_layers}")
-        print(f"[WSM] 💡 Tip: Set WSM_SKIP_PRELOAD_WAIT=1 to skip waiting and prefetch on-the-fly")
-        print(f"[WSM] 💡 Or set WSM_PRELOAD_TIMEOUT=<seconds> to adjust timeout")
         return False
 
     # -------- CPU/GPU movement primitives --------
@@ -2252,11 +2203,6 @@ class WeightStreamingManager:
     def _setup_resident_norms(self):
         """
         Move norm modules to GPU and exclude them from streaming/eviction.
-        ★ 修复 7: 遵守预算上限，防止碎片和 OOM
-        ★ 关键改进：
-          1. 使用 copy_stream + non_blocking=True 异步上卡，降低初始化延迟
-          2. 更新 name_to_param / param_owner 映射，确保参数引用一致性
-          3. norm 层永不被 _evict_group_immediately 驱逐（仅处理 attn/ffn 组）
         """
         if self.verbose:
             print("[WSM] Setting up resident norm layers...")
@@ -2290,7 +2236,7 @@ class WeightStreamingManager:
                         continue
 
                     try:
-                        # ★ 使用异步拷贝流 + non_blocking 上卡（减少阻塞）
+                        # 使用异步拷贝流 + non_blocking 
                         if self._copy_stream is not None:
                             with torch.cuda.stream(self._copy_stream):
                                 for pname, p in module.named_parameters(recurse=True):
@@ -2302,7 +2248,7 @@ class WeightStreamingManager:
                                             p_gpu, requires_grad=p.requires_grad
                                         )
 
-                                        # ★ 更新全局映射：确保后续查询拿到的是 GPU 版本
+                                        #  更新全局映射：确保后续查询拿到的是 GPU 版本
                                         full_name = f"layers.{layer_id}.{module_name.replace('norm_', '')}.{pname}"
                                         self.name_to_param[full_name] = module._parameters[pname.split('.')[-1]]
                                         self.param_owner[full_name] = (module, pname.split('.')[-1])
@@ -2328,7 +2274,7 @@ class WeightStreamingManager:
 
     def _check_and_throttle_kv(self):
         """
-        ★ 修复 8: 检查 weight_h2d backlog，必要时 throttle KV I/O
+        检查 weight_h2d backlog，必要时 throttle KV I/O
         避免 KV 抢带宽导致权重迟迟不上来
         """
         # 同时观察两条 H2D 流
@@ -2443,7 +2389,6 @@ class WeightStreamingManager:
     ):
         """
         确保参数在 GPU 上（从 CPU cache 加载）。
-        ★ 约定：这里只做“最佳努力”的非阻塞 H2D，不再在这里等待 CPU/SSD I/O。
         真正的分层预取由 sliding window + CPU/H2D worker 负责。
         """
         nvtx.range_push("param_h2d")
@@ -2619,19 +2564,6 @@ class WeightStreamingManager:
             else:
                 # Regular parameter - use standard method
                 self._ensure_param_on_gpu(p, layer_idx, full_param_name)
-
-        # Replace meta parameters
-        # for param_name, new_param in params_to_replace.items():
-        #     # 使用 _parameters 字典直接替换，这是 PyTorch 的内部机制
-        #     m._parameters[param_name] = new_param
-
-        #     # 更新全名映射（影响驱逐正确性）
-        #     full_param_name = params_full_names.get(param_name)
-        #     if full_param_name:
-        #         # 更新 name_to_param：全名 -> Parameter 对象
-        #         self.name_to_param[full_param_name] = getattr(m, param_name)
-        #         # 更新 param_owner：全名 -> (module, attr_name)
-        #         self.param_owner[full_param_name] = (m, param_name)
         
         for param_name, new_param in params_to_replace.items():
             # 1) 替换到模块
@@ -2648,14 +2580,6 @@ class WeightStreamingManager:
                 # name -> (module, attr)
                 self.param_owner[full_param_name] = (m, param_name)
                 
-        # for b in m.buffers(recurse=True):
-        #     if b.device.type == "cpu":
-        #         with torch.cuda.stream(self.streams.weight_h2d):
-        #             b_gpu = b.detach().to(self.device, non_blocking=True)
-        #         try:
-        #             b.data = b_gpu
-        #         except Exception:
-        #             pass
         for b in m.buffers(recurse=True):
         # 对于 meta buffer，先 to_empty(materialize) 再填充；对于已有CPU/GPU buffer，保持原逻辑
             if getattr(b, "is_meta", False):
@@ -2747,7 +2671,7 @@ class WeightStreamingManager:
                 except Exception:
                     pass
 
-            # 7) ★ 用 GPU frontier 驱动 CPU 环窗
+            # 用 GPU frontier 驱动 CPU 环窗
             try:
                 front = self.gpu_frontier()
                 self._schedule_cpu_ring_async(int(front))
@@ -2828,7 +2752,7 @@ class WeightStreamingManager:
         """
         返回当前在 GPU 的组快照：[(layer, 'attn'/'ffn', in_use_bool, inflight_bool), ...]
         顺序按照内部环列当前排列（仅用于调试，不再表示 LRU）。
-        ★ 修复：统一加锁复制快照，避免并发访问导致的数据不一致
+        统一加锁复制快照，避免并发访问导致的数据不一致
         """
         with self._group_lock:
             # 一次性复制所有需要的数据结构快照
@@ -2851,7 +2775,7 @@ class WeightStreamingManager:
         返回当前在 CPU cache 中的组快照：
         [(layer, 'attn'/'ffn', present_cnt, total_cnt), ...]
         只要该组至少有一个参数在 CPU cache 中就会展示；便于观察"部分命中"。
-        ★ 修复：加锁访问 cpu_cache，避免并发修改导致的数据不一致
+        加锁访问 cpu_cache，避免并发修改导致的数据不一致
         """
         summary = []
         with self.cpu_cache_lock:
@@ -2888,7 +2812,7 @@ class WeightStreamingManager:
             return
 
         def _fmt_gpu(item):
-            # ★ 修复：移除直接访问 self._gpu_group_inflight（无锁访问）
+            # 移除直接访问 self._gpu_group_inflight（无锁访问）
             # _snapshot_gpu_groups() 已经返回包含 inflight 的4元组
             if len(item) == 3:
                 # 兼容旧版本快照（无 inflight 信息）

@@ -8,7 +8,7 @@
 2) from-checkpoint      : 从单个 consolidated.pth/.safetensors 打包 -> 生成 manifest
 3) from-meta            : 从 shapes_meta.json 生成 runtime_manifest.json
 4) template             : 生成 manifest 模板
-5) from-shards-stream   : ★ 推荐：从 Meta 分片目录（consolidated.00..NN.pth）逐层 streaming 合并后直接打包（不会OOM）
+5) from-shards-stream   : 从 Meta 分片目录（consolidated.00..NN.pth）逐层 streaming 合并后直接打包（不会OOM）
 
 示例:
   # 逐层streaming（不会把全模型一次性载入内存）

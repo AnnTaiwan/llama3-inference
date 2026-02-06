@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import os
 from pathlib import Path
 import threading
@@ -14,12 +12,7 @@ import re
 from datetime import datetime, timezone
 from contextlib import contextmanager, nullcontext
 
-#  CUDA 内存分配器配置（必须在 import torch 之前）
-# expandable_segments 与异步流操作可能有冲突，暂时禁用
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 限制分块大小，减少碎片
-
-#  WSM 无兜底策略：锁定事件驱动调度，禁用同步兜底 (no-fallback)
 os.environ["WSM_NO_FALLBACK"] = "1"
 
 #  启用层级性能 profiling（CUDA timer 统计 attn/ffn/kv_fetch 等详细时间）
@@ -37,20 +30,18 @@ except Exception:
     nvtx = None
     NVTX_AVAILABLE = False
 
-# ===== 你可以改这里：日志输出目录 & 运行标签（可留空） =====
 LOG_DIR = Path("/home/roger/logs")   # 自动创建
-RUN_TAG = ""                         # 例如 "ablation-a1"；留空则自动仅用 run_id
+RUN_TAG = ""                        
 
-# ===== 项目内模块 =====
 from llama3.generator import LLaMA  # noqa: E402
 from llama3.config import KVCacheArgs, load_runtime_config, runtime_config_to_dict  # noqa: E402
 from llama3 import generator as _gen, stream_mnt  # noqa: E402
 try:
-    from llama3.layers import PERF_TRACKER  # 新增：从 layers.py 拿到全局的性能统计器
+    from llama3.layers import PERF_TRACKER 
 except Exception:
     PERF_TRACKER = None
 
-# ========== build() 包装：只加日志，不改库 ==========
+# ========== build()  ==========
 _orig_build = _gen.LLaMA.build
 
 def _debug_build(*args, **kw):
@@ -72,13 +63,13 @@ def _debug_build(*args, **kw):
         ssd = bool(getattr(wsm, "ssd_enabled", False) or getattr(wsm, "ssd", None))
         print(f"[MODE-DECISION] built: WSM present, ssd_enabled={ssd}")
     else:
-        print("[MODE-DECISION] built: NO WSM (可能是 full-cpu/full-gpu/旧 streaming)")
+        print("[MODE-DECISION] built: NO WSM ")
     return llama
 
 _gen.LLaMA.build = staticmethod(_debug_build)
 
-# ======= 轻量级 Profiler（低扰动；CUDA Events；保存 JSON/CSV） =======
-PROFILER = None  # 全局句柄
+# =======  Profiler =======
+PROFILER = None  
 
 def _now_utc():
     return datetime.now(timezone.utc).isoformat()
@@ -93,14 +84,14 @@ class InferenceProfiler:
     def __init__(self, run_name: str | None = None):
         self.run_id   = run_name or f"run-{uuid.uuid4().hex[:8]}"
         self.t0_ns    = time.perf_counter_ns()
-        self.timeline = []   # 墙钟阶段
+        self.timeline = []   
         self.active   = False
         self.cuda     = torch.cuda.is_available()
         self.forward_events = []      # GPU：[(kind,batch,seqlen,start_ev,end_ev)]
         self.forward_events_cpu = []  # CPU 回退：[(kind,batch,seqlen,dt_ms)]
         self.bookkeep  = {}
         
-        # 新增：decode step 计数 + 是否启用 NVTX
+        # decode step 计数 + 是否启用 NVTX
         self.decode_step_idx = 0
         self.use_nvtx = bool(self.cuda and NVTX_AVAILABLE)
 
@@ -199,13 +190,8 @@ class InferenceProfiler:
         """当前相对 t0 的墙钟时间（毫秒），供外部补丁使用。"""
         return (time.perf_counter_ns() - self.t0_ns) / 1e6
 
-    # ---------------- NVML util 采样（可选） ----------------
+    # ---------------- NVML util  ----------------
     def _start_nvml_sampler(self):
-        """启动 NVML 采样线程。
-
-        说明：NVML 的 util 采样周期由驱动决定，通常在 ~1s 到 ~166ms 之间波动。
-        因此采样间隔设得比 100ms 更小也不一定会更精确。
-        """
         try:
             import pynvml  # pip install nvidia-ml-py
         except Exception as e:
@@ -219,7 +205,6 @@ class InferenceProfiler:
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         stop_evt = threading.Event()
         self._nvml_stop = stop_evt
-        # 使用 self.nvml_samples（已在 __init__ 中初始化）
 
         def _worker():
             while not stop_evt.is_set():
@@ -790,7 +775,7 @@ class InferenceProfiler:
         # 6.1 GPU 计算时间（layers.py 里的 PERF_TRACKER）
         perf_per_layer: Dict[int, Dict[str, float]] = {}
         perf_stats: Dict[str, Any] = {}
-        # ★ 新增：decode 阶段按 layer 聚合的 MHA / FFN 时间，用来从总量中扣出 prefill 部分
+        # decode 阶段按 layer 聚合的 MHA / FFN 时间，用来从总量中扣出 prefill 部分
         decode_attn_per_layer: Dict[int, float] = {}
         decode_ffn_per_layer: Dict[int, float] = {}
 
@@ -902,7 +887,7 @@ class InferenceProfiler:
             mem_us = float(lp.get("memory_alloc_us", 0.0))
             weights_hbm_us = float(lp.get("weights_hbm_us", 0.0))
 
-            # ★ 新增：根据 per_step(decode) 里累积的数据拆出 prefill / decode 的 MHA / FFN
+            # 根据 per_step(decode) 里累积的数据拆出 prefill / decode 的 MHA / FFN
             dec_attn_us = float(decode_attn_per_layer.get(lid, 0.0))
             dec_ffn_us = float(decode_ffn_per_layer.get(lid, 0.0))
             pre_attn_us = max(0.0, attn_us - dec_attn_us)
@@ -933,13 +918,11 @@ class InferenceProfiler:
                     "total_forward_us": total_forward_us,
                     "memory_alloc_us": mem_us,
                     "weights_hbm_us": weights_hbm_us,
-                    # ★ 新增：prefill / decode 拆分（仍然是 us）
                     "prefill_attn_us": pre_attn_us,
                     "decode_attn_us": dec_attn_us,
                     "prefill_ffn_us": pre_ffn_us,
                     "decode_ffn_us": dec_ffn_us,
                 },
-                # ★ 新增：方便直接读的 ms 视图
                 "compute_ms_split": {
                     "prefill_attn_ms": _us_to_ms(pre_attn_us),
                     "decode_attn_ms": _us_to_ms(dec_attn_us),

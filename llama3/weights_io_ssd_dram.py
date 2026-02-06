@@ -455,7 +455,6 @@ def load_resident_to_gpu(
 
         param = name_to_param[actual_name]
 
-        # ★ 形状验证：确保加载的权重与模块参数形状一致
         # 特别关键的对齐要求：
         # 1. nn.Embedding(num_embeddings, embedding_dim): num_embeddings 必须等于 weight.shape[0]
         # 2. output/lm_head: nn.Linear(dim, vocab_size): vocab_size 必须等于 weight.shape[0]

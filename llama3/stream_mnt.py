@@ -121,7 +121,6 @@ class Streams:
             return
         if self.weight_h2d_mha is None and self.weight_h2d_ffn is None :
             return
-        # ★ 修正：进入 device 上下文再取 current_stream
         dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
         with torch.cuda.device(dev):
             cur = torch.cuda.current_stream()
