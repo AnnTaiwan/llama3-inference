@@ -1,11 +1,7 @@
-# llama3_project
-
-最小可用的 LLaMA-3 推理工程，将原始单文件拆分成模块化包，便于维护与扩展。
-
 ## 執行inference直接使用 `inferencellama3-1-70B_overlap_metrics.py`
 ## llama3
 ###  `__init__.py`
-初始化
+* 初始化
 ### `config.py`
 * 默認參數設定
 * 主要是還KV args以及model args兩個部分
@@ -60,9 +56,7 @@
 ### `weight_lbt.py`
 * 這個部分寫的不好, 有興趣可以按照我的論文中的那種方法進行修改, 這邊太多table了, 反而會拖慢效率, 這個改了說不定會更快
 ### `weight_streaming_manager.py`
-* 這是一坨💩
-* 裡面很多function其實在做一樣的事情, 但是最後能按照我想要的邏輯來跑, 結果是好的
-* 但是這個是sliding window的核心, 如果要復現FABLE就需要看懂這個就好, 但是裡面肯定有很多是用不到的function, 所以其實沒有那麼多東西, 有些是同步的部分我好像沒有刪掉
+* 這個是sliding window的核心, 如果要復現FABLE就需要看懂這個就好, 但是裡面肯定有很多是用不到的function, 所以其實沒有那麼多東西, 有些是同步的部分我好像沒有刪掉
 * 注意一個點就是sliding window是不行從尾巴變成第一個, 也就是layer 79 不會自己指向 layer 0, 所以我有一個ring window用來做這個事
 * 注意一個點就是mark mha或者ffn這個部分是用來lock前後關係的
 * 裡面可能還有殘留的LRU和OPT策略, 看到記得刪除, 只需要使用sliding window來管理
@@ -79,7 +73,15 @@
 * 要看inference的流程直接從 main開始看就好了
 * 參數配置就不多說了
 * 主要是對prompt的處理部分, 裁剪和batch的部分可能需要仔細看一下
-
+```
+GPU_AHEAD_LAYERS = 8 #prefetch distance
+GPU_MAX_GROUPS   = 12 #gpu最大能放多少個
+GPU_WARMUP_LAYERS = 10 #warmup的時候放多少個layer到gpu中
+CPU_CACHE_LAYERS = 47# #dram最多多少layer
+DEFAULT_BATCH_SIZE  = int(os.getenv("PROMPT_BATCH", "64"))   # batch size
+DEFAULT_MAX_GEN_LEN = int(os.getenv("GEN_TOKENS", "32"))    # 生成 token 数
+```
+* 如果要復現實驗就最主要通過修改這個來inference
 ## `generate_manifest.py`
 * 這個是生產model使用raw block device的初始化腳本
 * 具體用法在code中都有, 只需要按照步驟就會生成了
@@ -101,3 +103,4 @@ def _hf_to_internal_name(name: str) -> str:
     return n
 ```
 不同model的這個部分肯定不一樣, 這個要看那個model的結構要自己改
+
