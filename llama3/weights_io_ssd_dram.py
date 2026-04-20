@@ -288,7 +288,7 @@ def pack_any_to_raw(
 
     for name, t in it:
         # 写入 raw（直接 bytes + padding）
-        t = t.detach().cpu().contiguous()
+        t = t.detach().cpu().contiguous() # 將 Tensor 轉換為連續的位元組流（contiguous()）
         raw = t.view(torch.uint8).numpy().tobytes()
         nbytes = len(raw)
         stride = round_up(nbytes, bsz)

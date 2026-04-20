@@ -313,6 +313,9 @@ class LLaMA:
         Ensure `freqs_complex` tensor lives on the correct device.
         If a direct `.to(device)` fails (e.g. stored as different type or shape),
         attempt to re-create it from model args.
+        
+        freqs_complex is a precomputed tensor of complex frequency values used for RoPE (Rotary Position Embeddings)
+        — a method for encoding positional information in transformer attention layers.
         """
         model = self.model
 
