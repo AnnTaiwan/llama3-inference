@@ -1047,6 +1047,9 @@ class LLaMA:
             start_decode = (
                 prefill_len  # 第一轮 decode 读的是 tokens[:, prefill_len-1:prefill_len]
             )
+            '''
+            takes the last prompt token as input to predict the first generated token, then writes it into tokens[:, prefill_len]
+            '''
 
             # 重置 CUDA 峰值内存统计（用于监控 batch=2 的显存峰值）
             if torch.cuda.is_available():
@@ -1066,11 +1069,11 @@ class LLaMA:
                     nvtx.range_push(f"token_{cur_pos}_sampling")
                     if temperature > 0:
                         probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                        next_tok = self._sample_top_p(probs, top_p)
+                        next_tok = self._sample_top_p(probs, top_p) # next_tok's shape is (bsz, 1)
                     else:
-                        next_tok = torch.argmax(logits[:, -1], dim=-1)
+                        next_tok = torch.argmax(logits[:, -1], dim=-1) # returns one token id per batch item, so shape is (bsz).
 
-                    next_tok = next_tok.reshape(-1)
+                    next_tok = next_tok.reshape(-1) # next_tok's shape is (bsz)
 
                     # Respect prompt region: keep original token if still in prompt
                     next_tok = torch.where(
@@ -1122,7 +1125,7 @@ class LLaMA:
                     )
 
                 # ---- KV profile (rough estimate, same as original logic) ----
-                kv_re_time = sum(self.model.kv_times)
+                kv_re_time = sum(self.model.kv_times) # 每一層在讀取或寫入 KV Cache 時記錄的耗時, 將所有層的 KV 存取時間加總，得到該 Token 生成步中，純粹花在「記憶體維護」上的時間。
                 bytes_per_token = (
                     2
                     * self.model.args.n_kv_heads

@@ -175,14 +175,14 @@ class InferenceProfiler:
         if self.cuda:
             self.gpu_t0 = torch.cuda.Event(enable_timing=True)
             self.gpu_t1 = torch.cuda.Event(enable_timing=True)
-            self.gpu_t0.record()
+            self.gpu_t0.record() # 這行程式碼執行時，會在 GPU 的任務隊列中放下一塊「起點計時牌」。當 GPU 處理到這個點時，會記錄下精確的硬體時間戳記。
 
-        with self.span("inference_e2e", "inference"):
-            yield
+        with self.span("inference_e2e", "inference"): # 記錄的是 CPU 端的啟動與結束時間
+            yield # 當你使用 with inference_scope(): 時，所有縮排在下方的推論程式碼都會在這裡執行。
 
         # 记录结束 event
         if self.cuda and self.gpu_t1 is not None:
-            self.gpu_t1.record()
+            self.gpu_t1.record() # 在所有推論指令（如矩陣乘法）都發送給 GPU 後，放下「終點計時牌」。
 
         self.active = False
     
