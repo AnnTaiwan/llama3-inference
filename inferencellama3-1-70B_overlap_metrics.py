@@ -2323,7 +2323,7 @@ def main():
         实际总 token 数 = tokens_out × batch_size
         """
         try:
-            if isinstance(out_tokens_obj, (list, tuple)):
+            if isinstance(out_tokens_obj, (list, tuple)): # 當 isinstance 的第二個參數是元組時，它會檢查對象是否符合元組中任何一個型別（邏輯上的 OR）
                 if len(out_tokens_obj) > 0 and isinstance(out_tokens_obj[0], (list, tuple)):
                     # 返回第一个样本的长度（假设所有样本长度相同或相近）
                     return len(out_tokens_obj[0])
@@ -2334,7 +2334,7 @@ def main():
             pass
         return None
 
-    tokens_out_count = _count_output_tokens(out_tokens)
+    tokens_out_count = _count_output_tokens(out_tokens) # out_tokens should be [list[list[int]]]
 
     # ==== 汇总与保存 ====
     mode = classify_mode(llama)

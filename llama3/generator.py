@@ -1148,7 +1148,7 @@ class LLaMA:
                 )
 
             # ---- Decode current batch output ----
-            for row in tokens.tolist():
+            for row in tokens.tolist(): # converts it to nested Python lists: [list[list[int]]]
                 if self.tokenizer.eos_token_id in row:
                     row = row[: row.index(self.tokenizer.eos_token_id)]
                 all_out_tokens.append(row)
