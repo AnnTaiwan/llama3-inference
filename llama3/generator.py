@@ -93,7 +93,7 @@ class LLaMA:
             parent = root_mod
             for p in parts[:-1]:
                 parent = getattr(parent, p)
-            setattr(parent, parts[-1], value)
+            setattr(parent, parts[-1], value) # setattr(a.b, "c", value)
 
         if use_raw_ssd:
             print(
@@ -147,7 +147,7 @@ class LLaMA:
                 for i, layer_info in enumerate(
                     self.model.layer_infos[: config["max_layers_in_gpu"]]
                 ):
-                    if layer_info.block is not None:
+                    if layer_info.block is not None: # layer_info.block is EncoderBlock(args, i)
                         print(f"  Loading layer {i} to GPU...")
                         layer_info.block = layer_info.block.to(self.args.device)
                         loaded_count += 1

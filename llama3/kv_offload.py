@@ -1023,7 +1023,11 @@ class KVOffloader:
         effective_dev = device if device is not None else self.device
         with torch.cuda.stream(s):
             self.prefetch_async(layer=layer_idx, blocks=blocks, bsz=effective_bsz, device=effective_dev)
-
+            """
+            1. Enters the context: activates stream s as the current CUDA stream
+            2. Executes all code inside the indented block using that stream
+            3. Exits the context: deactivates stream s and restores the previous stream
+            """
     def wait_blocks_ready(self, layer: int, blocks: List[int], stream: Optional[torch.cuda.Stream] = None):
         s = stream or torch.cuda.current_stream()
         for b in set(int(x) for x in blocks):

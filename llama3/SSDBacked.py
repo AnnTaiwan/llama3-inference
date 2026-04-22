@@ -7,7 +7,8 @@ ALIGN = 4096
 def aligned_array(shape, dtype, align=ALIGN):
     nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
     buf = np.empty(nbytes + align, dtype=np.uint8)
-    offset = (-buf.ctypes.data) % align
+    offset = (-buf.ctypes.data) % align # Just like 4096*n is the aligned address after buf, so calculate (4096*n - buf) % 4096, which will become the skip bytes num.
+    # Python calculates: "what do I add to -buf to get a multiple of 4096?"
     arr = buf[offset:offset+nbytes].view(dtype)
     return arr.reshape(shape)
 
@@ -81,10 +82,10 @@ class RawBlockKVBackend:
                 raise IOError(f"preadv read {nread} bytes, expected {self.stride}")
         else:
             # 回退：用 bytes 读 + 拷贝到对齐数组（你的原有路径）
-            buf = aligned_array((self.stride,), np.uint8)
+            buf = aligned_array((self.stride,), np.uint8) # Aligned buffer
             raw_bytes = os.pread(self.fd, self.stride, self._offset(layer, slot))
-            buf[:len(raw_bytes)] = np.frombuffer(raw_bytes, dtype=np.uint8)
-            arr[:] = buf[:self.stride]
+            buf[:len(raw_bytes)] = np.frombuffer(raw_bytes, dtype=np.uint8) # Copy bytes into aligned buf
+            arr[:] = buf[:self.stride] # Then copy to destination
         return self.stride
         
     # ---------- 直接从 pinned 写（对齐要求：nbytes=stride, offset 对齐） ----------
