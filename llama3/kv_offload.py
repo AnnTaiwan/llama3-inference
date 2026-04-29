@@ -22,7 +22,7 @@ from .global_state_tracker import get_global_tracker, init_global_tracker, Stora
 BLOCK = 256  # tokens / block
 
 
-class _TTLDict(OrderedDict):
+class _TTLDict(OrderedDict): # OrderedDict 會記住鍵值對插入的順序。這使得實作 LRU (Least Recently Used) 淘汰機制變得非常簡單，因為最老的資料永遠在最前面。
     """
     带 TTL 和容量限制的字典，用于防止 prefetch map 内存泄漏。
     - 自动淘汰最老的 entries（LRU）
@@ -38,7 +38,7 @@ class _TTLDict(OrderedDict):
         now = time.time()
         super().__setitem__(key, (now, value))
         # LRU 淘汰
-        while len(self) > self.maxlen:
+        while len(self) > self.maxlen: # 目前快取中存有多少個鍵值對 (Entries)
             self.popitem(last=False)
         # TTL 清理（轻量扫描）
         self._sweep(now)
@@ -327,8 +327,8 @@ class KVOffloader:
             self.h2d_stream = getattr(streams, "kv_h2d", None)
             self.d2h_stream = getattr(streams, "kv_d2h", None)
         else:
-            self.h2d_stream = torch.cuda.Stream(device=self.device, priority=0) if self.device.startswith("cuda") else None
-            self.d2h_stream = torch.cuda.Stream(device=self.device, priority=+1) if self.device.startswith("cuda") else None
+            self.h2d_stream = torch.cuda.Stream(device=self.device, priority=0) if self.device.startswith("cuda") else None # larger priority 
+            self.d2h_stream = torch.cuda.Stream(device=self.device, priority=+1) if self.device.startswith("cuda") else None # smaller priority
 
         # ------- DRAM 配额估计 -------
         alloc_bsz = int(getattr(KVCacheArgs, "dram_sizing_batch", 8))
