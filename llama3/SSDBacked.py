@@ -131,7 +131,7 @@ class RawBlockKVBackend:
         if self.stride > self.blk_bytes:
             buf[self.blk_bytes:] = 0
 
-        os.pwrite(self.fd, buf, self._offset(layer, slot))
+        os.pwrite(self.fd, buf, self._offset(layer, slot)) # os.pwrite will write whole buf into dest, so here it writes writes self.stride bytes
         if sync:
             os.fsync(self.fd)
 
@@ -211,7 +211,7 @@ class RawBlockKVBackend:
                 - 兼容：任意 GPU tensor，将从临时 buffer 拷贝
         """
         # 零拷贝路径：dst 是 pinned uint8 tensor
-        if dst.dtype == torch.uint8 and dst.is_pinned() and dst.is_contiguous():
+        if dst.dtype == torch.uint8 and dst.is_pinned() and dst.is_contiguous(): # dst is at CPU DRAM
             if dst.numel() >= self.stride:
                 arr = dst.numpy()[:self.stride]
                 ptr = arr.ctypes.data
@@ -227,13 +227,13 @@ class RawBlockKVBackend:
                     # 注意：调用方需要从 dst[:self.blk_bytes] 做 view/reshape
                     return self.stride
 
-        # 兼容路径：dst 是 GPU tensor（旧API）
-        buf = aligned_array((self.stride,), np.uint8)
+        # 兼容路径：dst 是 GPU tensor（旧API）# dst is at GPU mem
+        buf = aligned_array((self.stride,), np.uint8) 
         raw_bytes = os.pread(self.fd, self.stride, self._offset(layer, slot))
         buf[:len(raw_bytes)] = np.frombuffer(raw_bytes, dtype=np.uint8)
         effective_data = buf[:self.blk_bytes]
-        h_tmp = torch.from_numpy(effective_data.copy()).view(torch.float16)
-        dst.copy_(h_tmp.reshape(dst.shape), non_blocking=True)
+        h_tmp = torch.from_numpy(effective_data.copy()).view(torch.float16) # h_tmp is CPU tensor
+        dst.copy_(h_tmp.reshape(dst.shape), non_blocking=True) # move to gpu
 
     # ---------- batch read ----------
     def read_batch(self, layer:int, slots:list, dst_tensors:list):

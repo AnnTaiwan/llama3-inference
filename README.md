@@ -64,7 +64,7 @@
 * 這個是把整個direct IO包起來的wrapper
 * 見誰整個runtime manifest的部分也在這邊, 也就是初始化raw block device的部分
 
-## `inferencellama3-1-70B_overlap_metrics.py
+## `inferencellama3-1-70B_overlap_metrics.py`
 * 絕大多數都是測試時間和數據的patch, 也就是`class InferenceProfiler`
 * 主要的參數在開頭部分有 
 * `CHUNK_SIZE = int(os.environ.setdefault("PREFILL_T_CHUNK", "512"))# prefill 分块大小`

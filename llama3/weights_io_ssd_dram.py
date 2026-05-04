@@ -107,11 +107,14 @@ class DirectIOFile:
 
             ptr = t.data_ptr()
             self._check_align(ptr, nbytes, offset)
-
+            '''
+            From: The raw SSD block device (represented by the file descriptor self.fd).
+            To: The host RAM, specifically directly into the PyTorch CPU tensor's memory buffer (represented by ptr, which is t.data_ptr()).
+            '''
             ret = libc.pread(self.fd, 
                              ctypes.c_void_p(ptr), 
                              ctypes.c_size_t(nbytes), 
-                             ctypes.c_longlong(offset))
+                             ctypes.c_longlong(offset)) # The offset tells the OS and the SSD exactly which physical byte address on the disk to start reading from.
             
             if ret < 0:
                 err = ctypes.get_errno()
@@ -302,7 +305,7 @@ def pack_any_to_raw(
 
         pad = stride - nbytes
         if pad:
-            zero = (ctypes.c_ubyte * pad)()
+            zero = (ctypes.c_ubyte * pad)() # constructs a C array of pad bytes (type unsigned char) initialized to zeros.
             ret = libc.pwrite(fd, ctypes.addressof(zero), ctypes.c_size_t(pad), ctypes.c_longlong(cur + nbytes))
             if ret < 0:
                 err = ctypes.get_errno()
@@ -448,10 +451,10 @@ def load_resident_to_gpu(
         if stride > staging.numel():
             staging = alloc_pinned_aligned(((stride + bsz - 1)//bsz)*bsz, bsz)
 
-        dio.pread_into_tensor(staging, stride, p["offset"])
+        dio.pread_into_tensor(staging, stride, p["offset"]) # From raw-ssd at p['offset'] to cpu pinned tensor(staging, staging + stride)
 
-        dst = torch.empty(p["shape"], dtype=DTYPE_MAP[p["dtype"]], pin_memory=True)
-        dst.view(-1).view(torch.uint8)[:p["nbytes"]].copy_(staging[:p["nbytes"]])
+        dst = torch.empty(p["shape"], dtype=DTYPE_MAP[p["dtype"]], pin_memory=True) # dst is also a pinned CPU tensor 
+        dst.view(-1).view(torch.uint8)[:p["nbytes"]].copy_(staging[:p["nbytes"]]) # copy from cpu tp cpu, copies the exact bytes needed (p["nbytes"]) from this generic raw buffer into a newly allocated CPU pinned tensor
 
         param = name_to_param[actual_name]
 
@@ -469,8 +472,8 @@ def load_resident_to_gpu(
 
             # 检测是否是 vocab-parallel 分片权重（仅对 embed 和 output 层检查）
             if (is_embed or is_output) and len(p["shape"]) >= 2:
-                weight_vocab_size = p["shape"][0]
-                param_vocab_size = param.shape[0]
+                weight_vocab_size = p["shape"][0] # This is the vocabulary size as recorded in the weights file on your SSD (the raw data you packed earlier).
+                param_vocab_size = param.shape[0] # This is the vocabulary size expected by the model definition currently instantiated in memory (e.g., your nn.Embedding or nn.Linear layer).
 
                 # 常见的完整 vocab_size
                 common_vocab_sizes = [128256, 128000, 32000, 50257]
@@ -526,14 +529,15 @@ def load_resident_to_gpu(
             raise RuntimeError(error_msg)
 
         # param.data.copy_(dst.to(device, non_blocking=True))
-        dst_dev = dst.to(device, non_blocking=True)
+        dst_dev = dst.to(device, non_blocking=True) # The actual CPU-to-GPU DMA transfer
         # 如果参数仍在 meta 上，直接"以新张量替换"完成实体化；否则走原来的 copy_ 路径
+        # By putting the model on the "meta" device, PyTorch creates the entire model structure (all the tensors, shapes, and layer definitions) but allocates 0 bytes of real memory. The tensors exist only conceptually.
         is_meta = getattr(param, "is_meta", False) or getattr(getattr(param, "data", None), "is_meta", False) \
                   or (hasattr(param, "device") and str(param.device).startswith("meta"))
         if is_meta or (param.device != dst_dev.device):
             param.data = dst_dev
         else:
-            param.data.copy_(dst_dev)
+            param.data.copy_(dst_dev) # If the parameter was already pointing to a real chunk of memory on the GPU
 
     dio.close()
     print("[RESIDENT] all resident params loaded to GPU")
@@ -577,24 +581,65 @@ def bench_raw_read(manifest_path: str, rounds: int = 8, chunk_bytes: int = 64*10
 # ========== CLI ==========
 
 def _cli():
+    """
+    Command-line usage summary (examples and important notes):
+
+    Commands:
+        pack <ckpt> <raw> [--meta-out PATH] [--header-reserve BYTES]
+            - Pack a checkpoint (single .pth or a directory containing
+                consolidated*.pth shards) into a raw block device.
+            - <ckpt> may be a file or a directory. If a directory is given,
+                files matching consolidated*.pth are processed in sorted order.
+            - <raw> must be a block device path (e.g. /dev/nvme0n1p4) and
+                requires proper permissions (often root). Packing writes
+                aligned, O_DIRECT writes into the device starting at
+                --header-reserve (default 4MiB).
+            - The command emits a shapes_meta.json (unless --meta-out set)
+                which contains portable parameter names/shapes/dtypes/nbytes
+                but NOT runtime offsets.
+
+        manifest <shapes_meta> [--out PATH]
+            - Build a runtime manifest from a previously produced
+                shapes_meta.json. This step must run on the target machine
+                / device because it queries the device block size and
+                computes block-aligned offsets and strides for O_DIRECT.
+            - The resulting runtime manifest contains per-parameter
+                offsets (used by the loader) and is safe for the local
+                device's block size.
+
+        bench-read <manifest> [--rounds N] [--chunk SIZE]
+            - Simple throughput test: reads contiguous chunks from the
+                raw device using O_DIRECT into a pinned buffer to estimate
+                NVMe read MB/s. Useful to tune streaming performance.
+
+    Important notes:
+        - Packing and manifest are intentionally split: packing is
+            portable and quick to run once; manifest generation is done
+            per-target to guarantee correct alignment and offsets.
+        - Do not run `pack` unless you understand it writes directly
+            to the specified raw device. Use a spare partition or file
+            designed for this purpose.
+        - This comment block is documentation only; no CLI behavior
+            or defaults are changed by this file edit.
+    """
     import argparse
     ap = argparse.ArgumentParser(description="Weights IO (O_DIRECT + raw device)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("pack", help="Pack checkpoint to raw device (once)")
-    sp.add_argument("ckpt", type=str)
-    sp.add_argument("raw", type=str, help="/dev/nvme0n1p4 etc.")
-    sp.add_argument("--meta-out", type=str, default=None)
-    sp.add_argument("--header-reserve", type=int, default=4*1024*1024)
+    sp.add_argument("ckpt", type=str, help="Path to checkpoint file (.pth) or directory with consolidated*.pth shards")
+    sp.add_argument("raw", type=str, help="Raw block device path to write into (e.g. /dev/nvme0n1p4). Requires correct permissions.")
+    sp.add_argument("--meta-out", type=str, default=None, help="Output path for shapes_meta.json; defaults to <ckpt>.shapes_meta.json")
+    sp.add_argument("--header-reserve", type=int, default=4*1024*1024, help="Number of bytes to reserve at start of device for headers (must be block-aligned)")
 
     sm = sub.add_parser("manifest", help="Build runtime manifest each start")
-    sm.add_argument("shapes_meta", type=str)
-    sm.add_argument("--out", type=str, default="/dev/shm/runtime_manifest.json")
+    sm.add_argument("shapes_meta", type=str, help="Path to shapes_meta.json produced by the pack command")
+    sm.add_argument("--out", type=str, default="/dev/shm/runtime_manifest.json", help="Output path for runtime manifest (contains offsets/strides for the local device)")
 
     sb = sub.add_parser("bench-read", help="Benchmark raw read throughput")
-    sb.add_argument("manifest", type=str)
-    sb.add_argument("--rounds", type=int, default=8)
-    sb.add_argument("--chunk", type=int, default=64*1024*1024)
+    sb.add_argument("manifest", type=str, help="Path to runtime manifest.json for the target raw device")
+    sb.add_argument("--rounds", type=int, default=8, help="Number of read rounds to perform for the benchmark")
+    sb.add_argument("--chunk", type=int, default=64*1024*1024, help="Chunk size (bytes) to read per round; will be rounded down to block size multiple")
 
     args = ap.parse_args()
     if args.cmd == "pack":

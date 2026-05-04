@@ -127,6 +127,9 @@ class ParamStore:
             max_workers=max_concurrent_io,
             thread_name_prefix="param_io"
         )
+        '''
+        執行緒池會保留已經建立的執行緒，避免頻繁建立/銷毀執行緒帶來的系統開銷
+        '''
 
     # 允许 with 语法
     def __enter__(self):
@@ -392,7 +395,7 @@ class ParamStore:
         异步版本的 fetch_layer，返回 Future[Dict[str, torch.Tensor]]。
         注意：to_device/stream 参数在异步场景需要谨慎使用（避免跨线程 CUDA 上下文问题）。
         """
-        return self.io_pool.submit(self.fetch_layer, layer_id, **kwargs)
+        return self.io_pool.submit(self.fetch_layer, layer_id, **kwargs) # submit 是非同步操作的發射器。與一般的函式呼叫不同，它不會等函式執行完，而是立刻回傳一個 Future 物件
 
     def fetch_layer_batch(self,
                           layer_ids: List[int],
@@ -409,6 +412,8 @@ class ParamStore:
         """
         futures = {lid: self.fetch_layer_async(lid, **kwargs) for lid in layer_ids}
         return {lid: fut.result() for lid, fut in futures.items()}
+        # 當你「真的需要」第 lid 層資料時，呼叫 .result()
+        # 如果那時候還沒搬完，程式會在這裡停下來等（Block）
 
     def offload_layer(self,
                       layer_id: int,

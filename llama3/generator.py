@@ -648,7 +648,7 @@ class LLaMA:
 
             # 用 SSD manifest 把"resident 模块"加载到目标设备（CPU->GPU 按需）
             # 这里只加载 embed/norm/output/bias；大权重按层 on-demand。
-            if hasattr(wsm, "load_resident_from_ssd"):
+            if hasattr(wsm, "load_resident_from_ssd"): # This function didn't exist, but the resident weights are loaded when calling _verify_and_fix_device_placement
                 wsm.load_resident_from_ssd(llama.model, target_device=device)
 
             # Integrate WSM hooks into layers
